@@ -37,6 +37,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backtest.engine import BacktestEngine
 from backtest.strategies import TrendStrengthWithML, TrendStrengthStrategy
 
+# Import ML modules for walk-forward training
+try:
+    from ml.generate_trade_labels import generate_labels
+    from ml.train_xgboost import load_and_split_data, train_xgboost, save_model, DEFAULT_PARAMS
+    from ml.feature_engineering import TRADE_FEATURES, CORE_FEATURES, compute_additional_features
+    import xgboost as xgb
+    ML_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: ML modules not available ({e}). Walk-forward training disabled.")
+    ML_AVAILABLE = False
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -248,23 +259,210 @@ def generate_random_windows(
 
 
 # =============================================================================
+# WALK-FORWARD XGBOOST TRAINING
+# =============================================================================
+
+def generate_labels_from_df(
+    df: pd.DataFrame,
+    output_path: str,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Generate trade labels from a DataFrame by running TrendStrength strategy.
+
+    Args:
+        df: DataFrame with features and predicted_regime
+        output_path: Path to save labeled data
+        verbose: Whether to print progress
+
+    Returns:
+        DataFrame with labeled trades
+    """
+    if not ML_AVAILABLE:
+        raise RuntimeError("ML modules not available")
+
+    # Run backtest to get trades
+    engine = BacktestEngine(
+        initial_capital=INITIAL_CAPITAL,
+        transaction_cost=TRANSACTION_COST,
+        slippage=SLIPPAGE
+    )
+
+    strategy = TrendStrengthStrategy()
+    result = engine.run(strategy, df)
+
+    if verbose:
+        print(f"    Generated {result.num_trades} trades (WR: {result.win_rate:.1%})")
+
+    if result.num_trades == 0:
+        return pd.DataFrame()
+
+    # Extract features for each trade
+    labeled_data = []
+    data_records = df.to_dict('records')
+
+    for trade in result.trades:
+        entry_idx = trade.entry_time
+
+        if entry_idx < 0 or entry_idx >= len(data_records):
+            continue
+
+        row = data_records[entry_idx]
+        history = data_records[max(0, entry_idx - 168):entry_idx]
+
+        # Extract core features
+        features = {}
+        for feat in CORE_FEATURES:
+            features[feat] = row.get(feat, 0)
+
+        # Add computed features
+        features.update(compute_additional_features(row, history))
+
+        # Add label: WIN (1) if P&L > 0, else LOSS (0)
+        features['label'] = 1 if trade.pnl > 0 else 0
+
+        # Add metadata
+        features['_entry_time'] = entry_idx
+        features['_pnl'] = trade.pnl
+        features['_pnl_pct'] = trade.pnl_pct
+
+        labeled_data.append(features)
+
+    labels_df = pd.DataFrame(labeled_data)
+
+    # Save
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    labels_df.to_csv(output_path, index=False)
+
+    return labels_df
+
+
+def train_period_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    period_name: str,
+    output_dir: Optional[str] = None,
+    verbose: bool = True
+) -> Optional[str]:
+    """
+    Train XGBoost model for a specific period using walk-forward approach.
+
+    Args:
+        train_df: Training data DataFrame
+        val_df: Validation data DataFrame
+        period_name: Name of the period
+        output_dir: Directory to save the model
+        verbose: Whether to print progress
+
+    Returns:
+        Path to saved model, or None if training failed
+    """
+    if not ML_AVAILABLE:
+        print("    ML modules not available, skipping training")
+        return None
+
+    # Use absolute path for output directory
+    if output_dir is None:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(base_dir, "checkpoints", "multiperiod")
+    elif not os.path.isabs(output_dir):
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(base_dir, output_dir)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Generate labels from training data
+    labels_path = os.path.join(output_dir, f"labels_{period_name}_train.csv")
+
+    if verbose:
+        print(f"    Generating trade labels from training data...")
+
+    train_df_copy = prepare_regime_predictions(train_df.copy())
+    labels_df = generate_labels_from_df(train_df_copy, labels_path, verbose=verbose)
+
+    if len(labels_df) < 10:
+        print(f"    WARNING: Only {len(labels_df)} trades in training data, insufficient for training")
+        return None
+
+    # Also generate validation labels for early stopping
+    val_labels_path = os.path.join(output_dir, f"labels_{period_name}_val.csv")
+    val_df_copy = prepare_regime_predictions(val_df.copy())
+    val_labels_df = generate_labels_from_df(val_df_copy, val_labels_path, verbose=False)
+
+    if len(val_labels_df) < 3:
+        # Use part of training for validation
+        n_val = max(3, len(labels_df) // 5)
+        val_labels_df = labels_df.tail(n_val)
+        labels_df = labels_df.head(len(labels_df) - n_val)
+
+    # Prepare features
+    feature_cols = [c for c in TRADE_FEATURES if c in labels_df.columns]
+    missing = [c for c in TRADE_FEATURES if c not in labels_df.columns]
+    for feat in missing:
+        labels_df[feat] = 0
+        val_labels_df[feat] = 0
+    feature_cols = TRADE_FEATURES
+
+    X_train = labels_df[feature_cols].values
+    y_train = labels_df['label'].values
+    X_val = val_labels_df[feature_cols].values
+    y_val = val_labels_df['label'].values
+
+    if verbose:
+        print(f"    Training XGBoost: {len(X_train)} train, {len(X_val)} val samples")
+        print(f"    Train WIN rate: {y_train.mean():.1%}")
+
+    # Train model
+    try:
+        model = train_xgboost(
+            X_train, X_val, y_train, y_val,
+            feature_names=feature_cols,
+            params=DEFAULT_PARAMS.copy(),
+            num_boost_round=200,
+            early_stopping_rounds=20,
+            verbose=False
+        )
+
+        # Save model
+        model_path = os.path.join(output_dir, f"trade_classifier_{period_name}.json")
+        features_path = os.path.join(output_dir, f"trade_classifier_{period_name}_features.json")
+
+        model.save_model(model_path)
+        with open(features_path, 'w') as f:
+            json.dump(feature_cols, f)
+
+        if verbose:
+            print(f"    Model saved to {model_path}")
+
+        return model_path
+
+    except Exception as e:
+        print(f"    ERROR training model: {e}")
+        return None
+
+
+# =============================================================================
 # WALK-FORWARD OPTIMIZATION
 # =============================================================================
 
-def walk_forward_test(df: pd.DataFrame, period_name: str) -> Dict:
+def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = True) -> Dict:
     """
-    Walk-forward analysis with rolling training windows.
+    Walk-forward analysis with proper XGBoost training on each period.
 
     Split:
-    - Train: First 70% of data
-    - Validate: Next 15% of data
-    - Test: Final 15% of data
+    - Train: First 70% of data (used for XGBoost training)
+    - Validate: Next 15% of data (used for early stopping)
+    - Test: Final 15% of data (out-of-sample evaluation)
 
-    This ensures truly non-overlapping training/test data.
+    For each period:
+    1. Generate trade labels from training data
+    2. Train XGBoost classifier on those labels
+    3. Test on val/test splits with freshly trained model
 
     Args:
         df: DataFrame with features
         period_name: Name of the period for logging
+        train_model: Whether to train a new model (True) or use existing
 
     Returns:
         Dict with walk-forward results
@@ -283,20 +481,33 @@ def walk_forward_test(df: pd.DataFrame, period_name: str) -> Dict:
     print(f"    Val:   {n_val} samples ({n_val/24:.0f} days)")
     print(f"    Test:  {n_test} samples ({n_test/24:.0f} days)")
 
+    results = {
+        'train_samples': n_train,
+        'val_samples': n_val,
+        'test_samples': n_test,
+        'model_path': None,
+        'splits': {}
+    }
+
+    # Step 1: Train XGBoost on training data
+    model_path = None
+    if train_model and ML_AVAILABLE:
+        print(f"\n  Training period-specific XGBoost model...")
+        model_path = train_period_model(train_df, val_df, period_name)
+        results['model_path'] = model_path
+
+        if model_path:
+            # Update the global model path for TrendStrengthWithML to use
+            # We need to temporarily set the model for testing
+            print(f"    Using trained model for evaluation")
+
     engine = BacktestEngine(
         initial_capital=INITIAL_CAPITAL,
         transaction_cost=TRANSACTION_COST,
         slippage=SLIPPAGE
     )
 
-    results = {
-        'train_samples': n_train,
-        'val_samples': n_val,
-        'test_samples': n_test,
-        'splits': {}
-    }
-
-    # Test on each split
+    # Step 2: Evaluate on each split
     for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
         if len(split_df) < 168:  # Need warmup
             results['splits'][split_name] = {'error': 'Insufficient data'}
@@ -305,7 +516,17 @@ def walk_forward_test(df: pd.DataFrame, period_name: str) -> Dict:
         # Prepare data with regime predictions
         split_df = prepare_regime_predictions(split_df)
 
-        strategy = TrendStrengthWithML(ml_threshold=0.5)
+        # Create strategy with period-specific model if available
+        if model_path and os.path.exists(model_path):
+            features_path = model_path.replace('.json', '_features.json')
+            strategy = TrendStrengthWithML(
+                ml_model_path=model_path,
+                ml_features_path=features_path,
+                ml_threshold=0.5
+            )
+        else:
+            strategy = TrendStrengthWithML(ml_threshold=0.5)
+
         result = engine.run(strategy, split_df)
 
         results['splits'][split_name] = {
@@ -755,6 +976,103 @@ def save_results(all_results: Dict, output_dir: str = "backtest/results_multiper
         print(f"Summary CSV saved to {summary_path}")
 
 
+def run_walk_forward_all_periods(train_models: bool = True) -> Dict:
+    """
+    Run walk-forward testing with XGBoost training for all periods.
+
+    This is the recommended way to test robustness - each period gets its own
+    model trained on the training portion of that period's data.
+
+    Args:
+        train_models: Whether to train fresh models for each period
+
+    Returns:
+        Dict with all results
+    """
+    print("=" * 60)
+    print("TRENDSTRENGTHML_50 WALK-FORWARD ROBUSTNESS TESTING")
+    print("With Period-Specific XGBoost Training")
+    print(f"Random Seed: {RANDOM_SEED}")
+    print("=" * 60)
+
+    if not ML_AVAILABLE:
+        print("\nWARNING: ML modules not available. Install xgboost to enable walk-forward training.")
+        print("Falling back to using pre-trained model (if available).\n")
+
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    all_results = {}
+
+    for period_name, config in PERIODS.items():
+        print(f"\n{'='*60}")
+        print(f"PERIOD: {period_name.upper()}")
+        print(f"Description: {config['description']}")
+        print(f"{'='*60}")
+
+        # Handle path
+        data_path = config['path']
+        if not os.path.isabs(data_path):
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            data_path = os.path.join(base_dir, data_path)
+
+        if not os.path.exists(data_path):
+            print(f"ERROR: Data not found at {data_path}")
+            continue
+
+        df = pd.read_csv(data_path)
+        print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
+
+        # Run walk-forward test with training
+        results = walk_forward_test(df, period_name, train_model=train_models)
+
+        # Add metadata
+        results['period'] = period_name
+        results['type'] = config['type']
+        results['description'] = config['description']
+
+        all_results[period_name] = results
+
+    return all_results
+
+
+def print_walk_forward_summary(all_results: Dict):
+    """Print summary of walk-forward test results."""
+
+    print("\n" + "=" * 60)
+    print("WALK-FORWARD TEST SUMMARY")
+    print("=" * 60)
+
+    if not all_results:
+        print("No results to summarize.")
+        return
+
+    # Focus on TEST split results (out-of-sample)
+    print(f"\n{'Period':<25} {'Type':<6} {'Test Return':>12} {'Test WR':>10} {'Trades':>8}")
+    print("-" * 70)
+
+    for period_name, results in all_results.items():
+        if results and results.get('splits', {}).get('test'):
+            test = results['splits']['test']
+            print(f"{period_name:<25} {results['type'].upper():<6} "
+                  f"{test['return']*100:>+11.2f}% {test['win_rate']*100:>9.1f}% "
+                  f"{test['trades']:>8}")
+
+    # Check success on TEST splits
+    print("\n--- Out-of-Sample (Test Split) Success Check ---")
+    test_results = []
+    for period_name, results in all_results.items():
+        if results and results.get('splits', {}).get('test'):
+            test_results.append(results['splits']['test'])
+
+    if test_results:
+        all_positive = all(r['return'] > 0 for r in test_results)
+        all_high_wr = all(r['win_rate'] >= 0.5 for r in test_results)  # Lower bar for OOS
+
+        print(f"  All periods positive return (OOS): {'PASS' if all_positive else 'FAIL'}")
+        print(f"  All periods WR >= 50% (OOS):       {'PASS' if all_high_wr else 'FAIL'}")
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -764,10 +1082,20 @@ def main():
                         help='Test specific period only')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not save results to files')
+    parser.add_argument('--walk-forward', '-wf', action='store_true',
+                        help='Run walk-forward testing with period-specific model training')
+    parser.add_argument('--no-train', action='store_true',
+                        help='Skip model training in walk-forward mode (use existing models)')
 
     args = parser.parse_args()
 
-    if args.period:
+    if args.walk_forward:
+        # Walk-forward testing with period-specific training
+        all_results = run_walk_forward_all_periods(train_models=not args.no_train)
+        print_walk_forward_summary(all_results)
+        if not args.no_save:
+            save_results(all_results, output_dir="backtest/results_multiperiod/walk_forward")
+    elif args.period:
         # Test single period
         results = run_period_backtest(args.period, PERIODS[args.period])
         if results:
@@ -777,7 +1105,7 @@ def main():
             if not args.no_save:
                 save_results(all_results)
     else:
-        # Test all periods
+        # Test all periods with existing model
         all_results = run_all_period_tests()
         print_summary(all_results)
         if not args.no_save:
