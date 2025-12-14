@@ -366,5 +366,84 @@ def prepare_dataset(csv_path: str, output_path: str = "data/processed/features.c
     return features
 
 
+def prepare_all_historical_datasets(
+    input_dir: str = "data/raw/historical",
+    output_dir: str = "data/processed/historical"
+) -> dict:
+    """
+    Prepare feature datasets for all historical periods.
+
+    Processes raw historical CSV files into feature-engineered datasets
+    ready for backtesting.
+
+    Args:
+        input_dir: Directory containing raw historical CSV files
+        output_dir: Directory to save processed feature files
+
+    Returns:
+        Dict mapping period names to output paths
+    """
+    periods = ['2018_bear', '2019_2020_recovery', '2023_2024_bull']
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    results = {}
+
+    print("=" * 60)
+    print("HISTORICAL FEATURE ENGINEERING")
+    print("=" * 60)
+
+    for period in periods:
+        input_path = os.path.join(input_dir, f"btcusdt_1h_{period}.csv")
+        output_path = os.path.join(output_dir, f"features_{period}.csv")
+
+        print(f"\nProcessing {period}...")
+
+        if os.path.exists(input_path):
+            try:
+                features = prepare_dataset(input_path, output_path)
+                results[period] = {
+                    'path': output_path,
+                    'samples': len(features),
+                    'status': 'success'
+                }
+                print(f"  Successfully processed {len(features)} samples")
+            except Exception as e:
+                results[period] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+                print(f"  ERROR: {e}")
+        else:
+            results[period] = {
+                'status': 'not_found',
+                'error': f'Input file not found: {input_path}'
+            }
+            print(f"  SKIPPED: Input file not found at {input_path}")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("FEATURE ENGINEERING SUMMARY")
+    print("=" * 60)
+
+    successful = sum(1 for r in results.values() if r.get('status') == 'success')
+    print(f"Successfully processed: {successful}/{len(periods)} periods")
+
+    for period, result in results.items():
+        if result.get('status') == 'success':
+            print(f"  ✓ {period}: {result['samples']} samples")
+        else:
+            print(f"  ✗ {period}: {result.get('error', 'unknown error')}")
+
+    return results
+
+
 if __name__ == "__main__":
-    prepare_dataset("data/raw/btcusdt_1h.csv")
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--historical":
+        # Process all historical datasets
+        prepare_all_historical_datasets()
+    else:
+        # Default: process current data
+        prepare_dataset("data/raw/btcusdt_1h.csv")
