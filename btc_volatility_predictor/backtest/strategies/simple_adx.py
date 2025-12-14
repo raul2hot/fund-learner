@@ -372,6 +372,167 @@ class VolTrendCombo(BaseStrategy):
         self._bars_held = 0
 
 
+class TrendStrengthWithML(BaseStrategy):
+    """
+    TrendStrength strategy + XGBoost WIN/LOSS filter.
+
+    This strategy combines the proven TrendStrength approach with
+    an ML-based trade quality filter to improve win rate.
+
+    Entry conditions (ALL must be true):
+    1. Vol = LOW (from SPHNet model)
+    2. Trend = UP (72h/168h SMA)
+    3. RSI < 45
+    4. XGBoost predicts WIN with probability >= threshold
+
+    Exit conditions:
+    - Take profit hit
+    - Stop loss hit
+    - Vol = HIGH
+    - Trend reverses to DOWN
+    - Max holding period exceeded
+    """
+
+    def __init__(
+        self,
+        ml_model_path: str = "checkpoints/trade_classifier.json",
+        ml_features_path: str = "checkpoints/trade_classifier_features.json",
+        ml_threshold: float = 0.6,  # Only trade if P(WIN) >= 60%
+        base_tp: float = 0.02,
+        base_sl: float = 0.015,
+        max_holding_bars: int = 48,
+    ):
+        super().__init__(name=f"TrendStrengthML_{int(ml_threshold*100)}")
+        self.ml_model_path = ml_model_path
+        self.ml_features_path = ml_features_path
+        self.ml_threshold = ml_threshold
+        self.base_tp = base_tp
+        self.base_sl = base_sl
+        self.max_holding_bars = max_holding_bars
+
+        self._bars_held: int = 0
+        self._current_tp: float = base_tp
+        self._current_sl: float = base_sl
+        self._ml_filter = None  # Lazy load to avoid circular imports
+
+        # Track ML filter stats
+        self._ml_blocks: int = 0
+        self._ml_allows: int = 0
+
+    def _get_ml_filter(self):
+        """Lazy load ML filter to avoid import issues."""
+        if self._ml_filter is None:
+            try:
+                from ml.trade_filter import TradeQualityFilter
+                self._ml_filter = TradeQualityFilter(
+                    model_path=self.ml_model_path,
+                    features_path=self.ml_features_path,
+                    default_threshold=self.ml_threshold
+                )
+            except Exception as e:
+                print(f"Warning: Could not load ML filter: {e}")
+                # Return a dummy filter that always allows trades
+                self._ml_filter = type('DummyFilter', (), {
+                    'is_ready': lambda: False,
+                    'should_trade': lambda *args, **kwargs: True
+                })()
+        return self._ml_filter
+
+    def generate_signal(
+        self,
+        row: dict,
+        predicted_regime: str,
+        history: list[dict]
+    ) -> Signal:
+
+        close = row.get('close', 0)
+        rsi = row.get('rsi_14', 50)
+        adx = row.get('adx_14', 20)
+
+        if self.has_position():
+            self._bars_held += 1
+        else:
+            self._bars_held = 0
+
+        trend = simple_trend(close, history, 72, 168)
+
+        # Adjust TP/SL based on ADX
+        if adx > 25:
+            self._current_tp = self.base_tp * 1.5
+            self._current_sl = self.base_sl
+        elif adx > 15:
+            self._current_tp = self.base_tp
+            self._current_sl = self.base_sl
+        else:
+            self._current_tp = self.base_tp * 0.75
+            self._current_sl = self.base_sl * 0.75
+
+        # ========== EXIT ==========
+        if self.has_position():
+            entry_price = self.position.entry_price
+            direction = self.position.direction
+
+            pnl_pct = (close - entry_price) / entry_price if direction == 'LONG' else (entry_price - close) / entry_price
+
+            if pnl_pct >= self._current_tp:
+                return 'CLOSE'
+            if pnl_pct <= -self._current_sl:
+                return 'CLOSE'
+            if predicted_regime == 'HIGH':
+                return 'CLOSE'
+            if direction == 'LONG' and trend == 'DOWN':
+                return 'CLOSE'
+            if self._bars_held >= self.max_holding_bars:
+                return 'CLOSE'
+
+            return 'HOLD'
+
+        # ========== ENTRY ==========
+        if predicted_regime != 'LOW':
+            return 'HOLD'
+
+        if len(history) < 168:
+            return 'HOLD'
+
+        # Base conditions: trend + RSI
+        if trend == 'UP' and rsi < 45:
+            # ML filter check
+            ml_filter = self._get_ml_filter()
+            if ml_filter.should_trade(row, history, threshold=self.ml_threshold):
+                self._ml_allows += 1
+                return 'BUY'
+            else:
+                self._ml_blocks += 1
+                return 'HOLD'
+
+        return 'HOLD'
+
+    def get_params(self) -> dict:
+        ml_filter = self._get_ml_filter()
+        return {
+            'strategy': 'TrendStrength + ML Filter',
+            'ml_threshold': f"{self.ml_threshold*100:.0f}%",
+            'ml_model_loaded': ml_filter.is_ready() if hasattr(ml_filter, 'is_ready') else False,
+            'base_tp': f"{self.base_tp*100}%",
+            'base_sl': f"{self.base_sl*100}%",
+        }
+
+    def get_ml_stats(self) -> dict:
+        """Get ML filter statistics."""
+        total = self._ml_allows + self._ml_blocks
+        return {
+            'ml_allows': self._ml_allows,
+            'ml_blocks': self._ml_blocks,
+            'ml_filter_rate': self._ml_blocks / total if total > 0 else 0,
+        }
+
+    def reset(self):
+        super().reset()
+        self._bars_held = 0
+        self._ml_blocks = 0
+        self._ml_allows = 0
+
+
 # ============================================================
 # BACKTEST RUNNER
 # ============================================================
