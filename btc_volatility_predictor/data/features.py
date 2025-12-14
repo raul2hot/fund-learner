@@ -160,6 +160,68 @@ def calc_vwap(df: pd.DataFrame, period: int = 24) -> pd.Series:
     return (typical_price * df['volume']).rolling(period).sum() / (df['volume'].rolling(period).sum() + 1e-10)
 
 
+def calc_adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate ADX (Average Directional Index) - Trend Strength Indicator.
+
+    ADX values interpretation:
+    - 0-20: Weak or absent trend (ranging market)
+    - 20-25: Emerging trend
+    - 25-50: Strong trend
+    - 50-75: Very strong trend
+    - 75-100: Extremely strong trend
+
+    Args:
+        df: DataFrame with 'high', 'low', 'close' columns
+        period: Lookback period (default 14)
+
+    Returns:
+        tuple: (adx, plus_di, minus_di)
+            - adx: Average Directional Index (0-100)
+            - plus_di: Positive Directional Indicator
+            - minus_di: Negative Directional Indicator
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    # True Range calculation
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # Smoothed True Range (Wilder's smoothing)
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+    # Directional Movement
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    # +DM and -DM
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+
+    # Smoothed +DM and -DM
+    plus_dm_smooth = plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    minus_dm_smooth = minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+    # Directional Indicators (+DI and -DI)
+    plus_di = 100 * (plus_dm_smooth / (atr + 1e-10))
+    minus_di = 100 * (minus_dm_smooth / (atr + 1e-10))
+
+    # DX (Directional Movement Index)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+
+    # ADX (smoothed DX)
+    adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+    return adx, plus_di, minus_di
+
+
 def calc_price_momentum(close: pd.Series, periods: list = [1, 6, 12, 24]) -> pd.DataFrame:
     """Price momentum at different lookbacks"""
     momentum = pd.DataFrame()
@@ -238,6 +300,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # ATR (normalized)
     features['atr_14'] = calc_atr(df, 14) / df['close']
     features['atr_24'] = calc_atr(df, 24) / df['close']
+
+    # --- ADX (Trend Strength) ---
+    features['adx_14'], features['plus_di_14'], features['minus_di_14'] = calc_adx(df, 14)
+    features['adx_21'], _, _ = calc_adx(df, 21)
+
+    # ADX-derived features
+    features['adx_trend_strength'] = features['adx_14'] / 50  # Normalized to ~0-2 range
+    features['di_diff'] = features['plus_di_14'] - features['minus_di_14']  # Directional bias
 
     # MACD
     macd, signal, hist = calc_macd(df['close'])
