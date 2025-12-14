@@ -229,7 +229,7 @@ def main():
     )
 
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     # Loss functions
     criterion_reg = nn.HuberLoss()  # Robust to outliers
