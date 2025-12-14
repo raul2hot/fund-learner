@@ -412,18 +412,26 @@ def train_volatility_model(
         # Update config with dataset metadata
         config.price_features = len(train_dataset.price_cols)
         config.engineered_features = len(train_dataset.eng_cols)
+        config.beta_ce = 1.0  # Focus on classification
+        config.alpha_mse = 0.0  # Disable regression
 
         # Create model with config object
         model = SPHNet(config).to(device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+        # Use config values like train_regime_extended.py
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        # Training loop
+        # Training loop (matching train_regime_extended.py)
         best_val_loss = float('inf')
-        patience = 10
+        patience = config.patience
         patience_counter = 0
-        max_epochs = 50
+        max_epochs = config.epochs
 
         if verbose:
             print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
@@ -431,19 +439,22 @@ def train_volatility_model(
         for epoch in range(max_epochs):
             model.train()
             train_loss = 0
+            n_batches = 0
             for batch in train_loader:
                 prices = batch['prices'].to(device)
                 features = batch['features'].to(device)
-                targets = batch['target'].to(device)
+                targets = batch['target'].to(device).unsqueeze(-1)  # Match extended
 
                 optimizer.zero_grad()
                 outputs = model(prices, features)
-                # Use direction_pred for binary classification
-                direction_pred = outputs['direction_pred'].squeeze()
-                loss = criterion(direction_pred, targets)
+                loss = criterion(outputs['direction_pred'], targets)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
                 optimizer.step()
                 train_loss += loss.item()
+                n_batches += 1
+
+            scheduler.step()  # Step the scheduler
 
             # Validation
             model.eval()
@@ -452,10 +463,9 @@ def train_volatility_model(
                 for batch in val_loader:
                     prices = batch['prices'].to(device)
                     features = batch['features'].to(device)
-                    targets = batch['target'].to(device)
+                    targets = batch['target'].to(device).unsqueeze(-1)
                     outputs = model(prices, features)
-                    direction_pred = outputs['direction_pred'].squeeze()
-                    val_loss += criterion(direction_pred, targets).item()
+                    val_loss += criterion(outputs['direction_pred'], targets).item()
 
             val_loss /= len(val_loader)
 
@@ -466,10 +476,11 @@ def train_volatility_model(
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                # Save best model
+                # Save best model (matching train_regime_extended.py format)
                 model_path = os.path.join(output_dir, f"sphnet_{period_name}.pt")
                 torch.save({
                     'model_state_dict': model.state_dict(),
+                    'config': config.__dict__,
                     'vol_threshold': train_dataset.vol_threshold,
                     'price_scaler': train_dataset.price_scaler,
                     'feature_scaler': train_dataset.feature_scaler,
