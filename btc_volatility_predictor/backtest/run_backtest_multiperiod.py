@@ -409,16 +409,12 @@ def train_volatility_model(
             val_dataset, batch_size=32, shuffle=False
         )
 
-        # Create model
-        model = SPHNet(
-            n_price_features=len(train_dataset.price_cols),
-            n_eng_features=len(train_dataset.eng_cols),
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_encoder_layers=config.n_encoder_layers,
-            dropout=config.dropout,
-            output_dim=1  # Binary classification
-        ).to(device)
+        # Update config with dataset metadata
+        config.price_features = len(train_dataset.price_cols)
+        config.engineered_features = len(train_dataset.eng_cols)
+
+        # Create model with config object
+        model = SPHNet(config).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
         criterion = torch.nn.BCEWithLogitsLoss()
@@ -440,8 +436,10 @@ def train_volatility_model(
                 targets = batch['target'].to(device)
 
                 optimizer.zero_grad()
-                outputs = model(prices, features).squeeze()
-                loss = criterion(outputs, targets)
+                outputs = model(prices, features)
+                # Use direction_pred for binary classification
+                direction_pred = outputs['direction_pred'].squeeze()
+                loss = criterion(direction_pred, targets)
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
@@ -454,8 +452,9 @@ def train_volatility_model(
                     prices = batch['prices'].to(device)
                     features = batch['features'].to(device)
                     targets = batch['target'].to(device)
-                    outputs = model(prices, features).squeeze()
-                    val_loss += criterion(outputs, targets).item()
+                    outputs = model(prices, features)
+                    direction_pred = outputs['direction_pred'].squeeze()
+                    val_loss += criterion(direction_pred, targets).item()
 
             val_loss /= len(val_loader)
 
@@ -520,16 +519,13 @@ def generate_regime_predictions_with_model(
         # Load model
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
+        # Create config and update with checkpoint metadata
         config = Config()
-        model = SPHNet(
-            n_price_features=len(checkpoint['price_cols']),
-            n_eng_features=len(checkpoint['eng_cols']),
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_encoder_layers=config.n_encoder_layers,
-            dropout=0,  # No dropout at inference
-            output_dim=1
-        ).to(device)
+        config.price_features = len(checkpoint['price_cols'])
+        config.engineered_features = len(checkpoint['eng_cols'])
+        config.dropout = 0  # No dropout at inference
+
+        model = SPHNet(config).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
@@ -549,8 +545,10 @@ def generate_regime_predictions_with_model(
                 batch = dataset[i]
                 prices = batch['prices'].unsqueeze(0).to(device)
                 features = batch['features'].unsqueeze(0).to(device)
-                output = torch.sigmoid(model(prices, features)).item()
-                predictions.append(1 if output > 0.5 else 0)
+                outputs = model(prices, features)
+                # Use direction_pred for regime classification
+                prob = torch.sigmoid(outputs['direction_pred']).item()
+                predictions.append(1 if prob > 0.5 else 0)
 
         # Pad predictions to match df length
         pad_length = len(df) - len(predictions)
