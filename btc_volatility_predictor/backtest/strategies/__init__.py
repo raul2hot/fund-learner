@@ -21,6 +21,9 @@ from .trend_follower import TrendFollowerStrategy
 # V4 Strategies - ADX Enhanced
 from .adx_trend_strategy import ADXTrendStrategy, ADXMeanReversion, CombinedADXStrategy
 
+# V4.1 Strategies - Simplified ADX (relaxed conditions)
+from .simple_adx import SimpleADXTrend, TrendStrengthStrategy, VolTrendCombo
+
 __all__ = [
     # Base
     'BaseStrategy',
@@ -49,4 +52,8 @@ __all__ = [
     'ADXTrendStrategy',
     'ADXMeanReversion',
     'CombinedADXStrategy',
+    # V4.1 Strategies (simplified ADX)
+    'SimpleADXTrend',
+    'TrendStrengthStrategy',
+    'VolTrendCombo',
 ]
