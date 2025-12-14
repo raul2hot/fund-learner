@@ -14,7 +14,7 @@ from data.dataset import create_dataloaders
 
 def load_model(checkpoint_path: str, config: Config, device: torch.device):
     """Load trained model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Update config if stored
     if 'config' in checkpoint:
