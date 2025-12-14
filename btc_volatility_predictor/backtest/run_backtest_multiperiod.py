@@ -85,6 +85,11 @@ PERIODS = {
         'path': 'data/processed/historical/features_2023_2024_bull.csv',
         'type': 'bull',
         'description': '2023-2024 Bull Market (ETF Rally, +376%)'
+    },
+    'last_365d': {
+        'path': 'data/processed/features_365d.csv',
+        'type': 'mixed',
+        'description': 'Last 365 Days (matches train_regime_extended.py)'
     }
 }
 
@@ -1478,6 +1483,8 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-Period Robustness Testing")
     parser.add_argument('--period', type=str, choices=list(PERIODS.keys()),
                         help='Test specific period only')
+    parser.add_argument('--365d', dest='last_365d', action='store_true',
+                        help='Shortcut for --period last_365d --walk-forward')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not save results to files')
     parser.add_argument('--walk-forward', '-wf', action='store_true',
@@ -1487,12 +1494,48 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle --365d shortcut
+    if args.last_365d:
+        args.period = 'last_365d'
+        args.walk_forward = True
+
     if args.walk_forward:
-        # Walk-forward testing with period-specific training
-        all_results = run_walk_forward_all_periods(train_models=not args.no_train)
-        print_walk_forward_summary(all_results)
-        if not args.no_save:
-            save_results(all_results, output_dir="backtest/results_multiperiod/walk_forward")
+        if args.period:
+            # Walk-forward testing for single period
+            print(f"\n{'='*60}")
+            print(f"WALK-FORWARD TEST: {args.period.upper()}")
+            print(f"{'='*60}")
+
+            config = PERIODS[args.period]
+            data_path = config['path']
+            if not os.path.isabs(data_path):
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                data_path = os.path.join(base_dir, data_path)
+
+            if not os.path.exists(data_path):
+                print(f"ERROR: Data not found at {data_path}")
+                return
+
+            df = pd.read_csv(data_path)
+            print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
+            print(f"Description: {config['description']}")
+
+            df = clean_dataframe_for_ml(df)
+            results = walk_forward_test(df, args.period, train_model=not args.no_train)
+            results['period'] = args.period
+            results['type'] = config['type']
+            results['description'] = config['description']
+
+            all_results = [results]
+            print_walk_forward_summary(all_results)
+            if not args.no_save:
+                save_results({args.period: results}, output_dir="backtest/results_multiperiod/walk_forward")
+        else:
+            # Walk-forward testing for all periods
+            all_results = run_walk_forward_all_periods(train_models=not args.no_train)
+            print_walk_forward_summary(all_results)
+            if not args.no_save:
+                save_results(all_results, output_dir="backtest/results_multiperiod/walk_forward")
     elif args.period:
         # Test single period
         results = run_period_backtest(args.period, PERIODS[args.period])
