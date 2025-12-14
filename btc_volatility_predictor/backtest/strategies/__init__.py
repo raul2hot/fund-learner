@@ -18,6 +18,9 @@ from .trend_filtered_mr import TrendFilteredMeanReversion
 from .trend_defensive import TrendAdaptiveDefensive
 from .trend_follower import TrendFollowerStrategy
 
+# V4 Strategies - ADX Enhanced
+from .adx_trend_strategy import ADXTrendStrategy, ADXMeanReversion, CombinedADXStrategy
+
 __all__ = [
     # Base
     'BaseStrategy',
@@ -42,4 +45,8 @@ __all__ = [
     'TrendFilteredMeanReversion',
     'TrendAdaptiveDefensive',
     'TrendFollowerStrategy',
+    # V4 Strategies (ADX enhanced)
+    'ADXTrendStrategy',
+    'ADXMeanReversion',
+    'CombinedADXStrategy',
 ]
