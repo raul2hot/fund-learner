@@ -51,6 +51,8 @@ except ImportError as e:
 # Import SPHNet for volatility regime training
 try:
     import torch
+    from tqdm import tqdm
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
     from train_regime import VolatilityRegimeDataset, create_regime_dataloaders
     from models import SPHNet
     from config import Config
@@ -338,6 +340,40 @@ def clean_dataframe_for_ml(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@torch.no_grad()
+def evaluate_regime_model(model, dataloader, device):
+    """Evaluate classification metrics (matching train_regime_extended.py)."""
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_targets = []
+
+    for batch in dataloader:
+        prices = batch['prices'].to(device)
+        features = batch['features'].to(device)
+        targets = batch['target'].numpy()
+
+        outputs = model(prices, features)
+        probs = torch.sigmoid(outputs['direction_pred']).cpu().numpy().flatten()
+        preds = (probs > 0.5).astype(float)
+
+        all_probs.extend(probs)
+        all_preds.extend(preds)
+        all_targets.extend(targets)
+
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+    all_targets = np.array(all_targets)
+
+    return {
+        'accuracy': accuracy_score(all_targets, all_preds),
+        'precision': precision_score(all_targets, all_preds, zero_division=0),
+        'recall': recall_score(all_targets, all_preds, zero_division=0),
+        'f1': f1_score(all_targets, all_preds, zero_division=0),
+        'auc': roc_auc_score(all_targets, all_probs) if len(np.unique(all_targets)) > 1 else 0.5
+    }
+
+
 def train_volatility_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -440,56 +476,48 @@ def train_volatility_model(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        # Training loop (matching train_regime_extended.py)
-        best_val_loss = float('inf')
-        patience = config.patience
+        # Training loop (matching train_regime_extended.py exactly)
+        best_val_auc = 0
         patience_counter = 0
-        max_epochs = config.epochs
 
-        for epoch in range(max_epochs):
+        for epoch in range(config.epochs):
             model.train()
-            train_loss = 0
+            total_loss = 0
             n_batches = 0
-            for batch in train_loader:
+
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False):
                 prices = batch['prices'].to(device)
                 features = batch['features'].to(device)
-                targets = batch['target'].to(device).unsqueeze(-1)  # Match extended
+                targets = batch['target'].to(device).unsqueeze(-1)
 
                 optimizer.zero_grad()
                 outputs = model(prices, features)
                 loss = criterion(outputs['direction_pred'], targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                train_loss += loss.item()
+
+                total_loss += loss.item()
                 n_batches += 1
 
-            scheduler.step()  # Step the scheduler
+            scheduler.step()
 
-            # Validation
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    prices = batch['prices'].to(device)
-                    features = batch['features'].to(device)
-                    targets = batch['target'].to(device).unsqueeze(-1)
-                    outputs = model(prices, features)
-                    val_loss += criterion(outputs['direction_pred'], targets).item()
+            # Validate
+            val_metrics = evaluate_regime_model(model, val_loader, device)
 
-            val_loss /= len(val_loader)
+            print(f"    Epoch {epoch+1}: Loss={total_loss/n_batches:.4f}, "
+                  f"Val Acc={val_metrics['accuracy']:.1%}, "
+                  f"Val AUC={val_metrics['auc']:.4f}, "
+                  f"Val F1={val_metrics['f1']:.4f}")
 
-            # Progress logging every 5 epochs
-            if verbose and (epoch + 1) % 5 == 0:
-                print(f"      Epoch {epoch+1}/{max_epochs}: val_loss={val_loss:.4f}, best={best_val_loss:.4f}")
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            # Early stopping on AUC
+            if val_metrics['auc'] > best_val_auc:
+                best_val_auc = val_metrics['auc']
                 patience_counter = 0
-                # Save best model (matching train_regime_extended.py format)
                 model_path = os.path.join(output_dir, f"sphnet_{period_name}.pt")
                 torch.save({
                     'model_state_dict': model.state_dict(),
+                    'val_metrics': val_metrics,
                     'config': config.__dict__,
                     'vol_threshold': train_dataset.vol_threshold,
                     'price_scaler': train_dataset.price_scaler,
@@ -497,16 +525,15 @@ def train_volatility_model(
                     'price_cols': train_dataset.price_cols,
                     'eng_cols': train_dataset.eng_cols,
                 }, model_path)
+                print(f"      Saved best model (AUC: {best_val_auc:.4f})")
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    if verbose:
-                        print(f"      Early stopping at epoch {epoch+1}")
+                if patience_counter >= config.patience:
+                    print(f"\n    Early stopping at epoch {epoch+1}")
                     break
 
-        if verbose:
-            print(f"    SPHNet trained, best val loss: {best_val_loss:.4f}")
-            print(f"    Model saved to {model_path}")
+        print(f"    SPHNet training complete. Best AUC: {best_val_auc:.4f}")
+        print(f"    Model saved to {model_path}")
 
         return model_path
 
