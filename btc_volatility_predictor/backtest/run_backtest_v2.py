@@ -347,7 +347,7 @@ def validate_success_criteria(results: list, predictions_df: pd.DataFrame) -> di
     # 1. MeanReversionV2 profitability
     mr_v2_results = [r for r in results if 'MeanReversionV2' in r.strategy_name]
     mr_v2_profitable = any(r.total_return > 0 for r in mr_v2_results)
-    criteria['mr_v2_profitable'] = mr_v2_profitable
+    criteria['mr_v2_profitable'] = bool(mr_v2_profitable)
     print(f"\n1. MeanReversionV2 profitable: {'PASS' if mr_v2_profitable else 'FAIL'}")
     for r in mr_v2_results:
         print(f"   {r.strategy_name}: {r.total_return*100:.2f}%")
@@ -355,13 +355,13 @@ def validate_success_criteria(results: list, predictions_df: pd.DataFrame) -> di
     # 2. Best Sharpe > 1.0
     best_sharpe = max(results, key=lambda r: r.sharpe_ratio)
     sharpe_pass = best_sharpe.sharpe_ratio > 1.0
-    criteria['best_sharpe_gt_1'] = sharpe_pass
+    criteria['best_sharpe_gt_1'] = bool(sharpe_pass)
     print(f"\n2. Best Sharpe > 1.0: {'PASS' if sharpe_pass else 'FAIL'}")
     print(f"   {best_sharpe.strategy_name}: Sharpe = {best_sharpe.sharpe_ratio:.2f}")
 
     # 3. Max drawdown < 15%
     all_dd_ok = all(r.max_drawdown < 0.15 for r in results)
-    criteria['max_dd_lt_15'] = all_dd_ok
+    criteria['max_dd_lt_15'] = bool(all_dd_ok)
     worst_dd = max(results, key=lambda r: r.max_drawdown)
     print(f"\n3. All max drawdown < 15%: {'PASS' if all_dd_ok else 'FAIL'}")
     print(f"   Worst: {worst_dd.strategy_name} at {worst_dd.max_drawdown*100:.1f}%")
@@ -369,7 +369,7 @@ def validate_success_criteria(results: list, predictions_df: pd.DataFrame) -> di
     # 4. 50+ trades for significance
     active_results = [r for r in results if r.strategy_name != 'BuyAndHold']
     trades_sufficient = any(r.num_trades >= 50 for r in active_results)
-    criteria['sufficient_trades'] = trades_sufficient
+    criteria['sufficient_trades'] = bool(trades_sufficient)
     total_trades = sum(r.num_trades for r in active_results)
     print(f"\n4. At least one strategy with 50+ trades: {'PASS' if trades_sufficient else 'FAIL'}")
     print(f"   Total trades across strategies: {total_trades}")
@@ -381,7 +381,7 @@ def validate_success_criteria(results: list, predictions_df: pd.DataFrame) -> di
 
     # Overall
     all_pass = all([mr_v2_profitable, sharpe_pass, all_dd_ok, trades_sufficient])
-    criteria['all_passed'] = all_pass
+    criteria['all_passed'] = bool(all_pass)
     print(f"\n{'='*60}")
     print(f"OVERALL: {'ALL CRITERIA PASSED' if all_pass else 'SOME CRITERIA FAILED'}")
     print(f"{'='*60}")
@@ -488,7 +488,7 @@ def main():
             'criteria': criteria,
             'prediction_accuracy': float(accuracy),
             'test_days': 90,
-            'n_samples': len(predictions_df)
+            'n_samples': int(len(predictions_df))
         }, f, indent=2)
 
     # Final summary
