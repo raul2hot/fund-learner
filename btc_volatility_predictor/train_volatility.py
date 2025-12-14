@@ -311,7 +311,7 @@ def main():
     print("="*60)
 
     # Load best model
-    checkpoint = torch.load(f"{config.checkpoint_dir}/best_model.pt")
+    checkpoint = torch.load(f"{config.checkpoint_dir}/best_model.pt", weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     test_metrics = validate(
