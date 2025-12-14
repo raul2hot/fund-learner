@@ -1526,10 +1526,10 @@ def main():
             results['type'] = config['type']
             results['description'] = config['description']
 
-            all_results = [results]
+            all_results = {args.period: results}  # Dict, not list
             print_walk_forward_summary(all_results)
             if not args.no_save:
-                save_results({args.period: results}, output_dir="backtest/results_multiperiod/walk_forward")
+                save_results(all_results, output_dir="backtest/results_multiperiod/walk_forward")
         else:
             # Walk-forward testing for all periods
             all_results = run_walk_forward_all_periods(train_models=not args.no_train)
