@@ -1,199 +1,239 @@
-# BTC Volatility Strategy V2 - Instructions for Claude Code
+# BTC Volatility Strategy V3: Trend-Filtered Mean Reversion
 
 ## Executive Summary
 
-**Problem**: Our initial backtest (10 days, 80% vol accuracy) showed ALL strategies lost money:
-- Breakout/Momentum in HIGH vol: -6% to -10%
-- Mean Reversion in LOW vol: ~0% (no signals triggered)
-- Buy & Hold: -3.7%
+V2 backtesting revealed critical insights:
+- **Volatility prediction works**: 75.7% accuracy ✅
+- **Direction prediction fails**: 49.8% (coin flip) ❌
+- **Bear market problem**: All LONG strategies lost money (-12% to -26%)
+- **Defensive strategy wins**: Beat market by 20% (-2.32% vs -22.68%)
 
-**Solution**: Learn from the proven `vol_filtered_mean_reversion_v2.py` approach:
-- Use 180-365 days of data (not 173)
-- Test on 90 days (not 10) for statistical significance  
-- **Only trade LOW volatility** (avoid HIGH vol entirely)
-- Use proper take profit/stop loss (not just indicator exits)
-- Add direction prediction to know UP vs DOWN
+**Key Insight**: We need a TREND FILTER, not a direction predictor.
 
 ---
 
-## Phase 1: Data & Model Retraining
+## V3 Strategy: Trend-Filtered Mean Reversion
 
-### Step 1.1: Fetch More Data (365 Days)
+### Core Concept
 
-Modify `data/fetch_binance.py` or create new script:
+Instead of predicting direction hour-by-hour (which doesn't work), we:
+1. **Detect the macro trend** using longer-term moving averages (7-day, 30-day)
+2. **Only trade WITH the trend** in LOW volatility
+3. **Exit/stay flat** in HIGH volatility OR against-trend conditions
 
-```python
-# fetch_extended_data.py
-"""Fetch 365 days of BTC/USDT data for extended backtesting."""
+### Decision Matrix
 
-from data.fetch_binance import fetch_binance_klines
+| Trend | Vol Regime | Action |
+|-------|------------|--------|
+| UPTREND | LOW | LONG mean reversion signals |
+| UPTREND | HIGH | EXIT / Reduce exposure |
+| DOWNTREND | LOW | SHORT mean reversion OR stay flat |
+| DOWNTREND | HIGH | EXIT / Stay flat |
+| SIDEWAYS | LOW | Trade both directions cautiously |
+| SIDEWAYS | HIGH | EXIT / Stay flat |
 
-if __name__ == "__main__":
-    # Fetch 365 days instead of 180
-    df = fetch_binance_klines(
-        symbol="BTCUSDT",
-        interval="1h",
-        days=365,
-        save_path="data/raw/btcusdt_1h_365d.csv"
-    )
-    print(f"Fetched {len(df)} candles ({len(df)/24:.0f} days)")
-```
+---
 
-### Step 1.2: Re-engineer Features
+## Implementation Plan
+
+### Phase 1: Setup Project Structure
 
 ```bash
-# Run feature engineering on new data
-python data/features.py --input data/raw/btcusdt_1h_365d.csv --output data/processed/features_365d.csv
+# Create project structure (if not exists)
+mkdir -p btc_volatility_predictor/{data/{raw,processed},backtest/{strategies,results_v3,trades},checkpoints,models,figures}
+
+# Copy existing V2 files as base
+cp backtest/strategies/mean_reversion_v2.py backtest/strategies/trend_filtered_mr.py
+cp backtest/strategies/defensive.py backtest/strategies/trend_defensive.py
+cp backtest/run_backtest_v2.py backtest/run_backtest_v3.py
 ```
 
-Or modify `data/features.py` to accept command line args.
+### Phase 2: Add Trend Detection
 
-### Step 1.3: Retrain Model with 90-Day Test Split
-
-**Critical Change**: Modify `train_regime.py` to use 90-day test period:
-
-```python
-# In create_regime_dataloaders():
-test_days = 90  # Changed from 10 to 90
-```
-
-Create `train_regime_extended.py`:
+Create `/backtest/strategies/trend_utils.py`:
 
 ```python
 """
-Train regime classifier with extended data and 90-day test period.
-"""
-# Key changes from train_regime.py:
-# 1. test_days = 90 (2160 hours)
-# 2. data_path = "data/processed/features_365d.csv"
-# 3. Save to checkpoints/best_regime_model_90d.pt
-```
+Trend detection utilities for V3 strategies.
 
----
-
-## Phase 2: Add Direction Prediction
-
-### Step 2.1: Modify Target Labels
-
-The current model predicts: `HIGH` or `LOW` volatility
-
-We need to predict: `HIGH_UP`, `HIGH_DOWN`, `LOW_UP`, `LOW_DOWN`
-
-**Option A**: Single 4-class classifier
-**Option B**: Two separate classifiers (volatility + direction) ← Recommended
-
-Create `train_direction.py`:
-
-```python
-"""
-Train a separate direction classifier.
-Predicts: Will next hour close HIGHER or LOWER than current close?
+Trend Classification:
+- UPTREND: Price > SMA_168 (7-day) AND SMA_168 > SMA_720 (30-day)
+- DOWNTREND: Price < SMA_168 AND SMA_168 < SMA_720
+- SIDEWAYS: Mixed conditions
 """
 
-# Target calculation:
-# direction_up = (df['close'].shift(-1) > df['close']).astype(int)
+import numpy as np
+from typing import Literal
 
-# Model: Can reuse SPHNet architecture with classification head
-# Or simpler: Use the MLP approach from vol_filtered_mean_reversion_v2.py
-```
+TrendType = Literal['UPTREND', 'DOWNTREND', 'SIDEWAYS']
 
-### Step 2.2: Combined Prediction for Trading
 
-```python
-class CombinedPredictor:
-    """Combines volatility regime and direction predictions."""
+def calculate_sma(history: list[dict], period: int, price_key: str = 'close') -> float:
+    """Calculate Simple Moving Average from history."""
+    if len(history) < period:
+        return None
     
-    def __init__(self, vol_model, dir_model):
-        self.vol_model = vol_model
-        self.dir_model = dir_model
+    prices = [h.get(price_key, 0) for h in history[-period:]]
+    return sum(prices) / len(prices)
+
+
+def calculate_ema(history: list[dict], period: int, price_key: str = 'close') -> float:
+    """Calculate Exponential Moving Average from history."""
+    if len(history) < period:
+        return None
     
-    def predict(self, prices, features):
-        vol_regime = self.vol_model.predict(prices, features)  # HIGH/LOW
-        direction = self.dir_model.predict(prices, features)   # UP/DOWN
-        
-        return {
-            'vol_regime': vol_regime,
-            'direction': direction,
-            'combined': f"{vol_regime}_{direction}"  # e.g., "LOW_UP"
-        }
-```
-
----
-
-## Phase 3: Implement Proven Mean Reversion Strategy
-
-### Key Insights from `vol_filtered_mean_reversion_v2.py`
-
-The old script showed **+39.90% return** with vol filtering vs unfiltered. Key differences:
-
-| Our Failed Approach | Proven Approach |
-|---------------------|-----------------|
-| RSI < 30 AND bb_position < 0.2 | RSI crosses below 30 (momentum) |
-| Exit on bb_position > 0.4 | Exit on take_profit (2%) or stop_loss (1%) |
-| No fixed TP/SL | Fixed TP=2%, SL=1.5% |
-| Complex exit conditions | Simple: TP, SL, mean_reversion, or max_holding |
-
-### Step 3.1: Create Improved Mean Reversion Strategy
-
-Create `backtest/strategies/mean_reversion_v2.py`:
-
-```python
-"""
-Mean Reversion Strategy V2 - Based on proven approach.
-
-Key changes from V1:
-1. Use signal CROSSOVER (RSI crosses below 30), not just level
-2. Fixed take profit / stop loss percentages
-3. Mean reversion exit to Bollinger middle band
-4. Maximum holding period (24 bars)
-5. Only trade in LOW volatility regime
-"""
-
-from dataclasses import dataclass
-from typing import Optional
-from .base import BaseStrategy, Signal, Position
+    prices = [h.get(price_key, 0) for h in history]
+    multiplier = 2 / (period + 1)
+    
+    # Initialize with SMA
+    ema = sum(prices[:period]) / period
+    
+    # Apply EMA formula
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+    
+    return ema
 
 
-class MeanReversionV2Strategy(BaseStrategy):
+def detect_trend(
+    current_price: float,
+    history: list[dict],
+    fast_period: int = 168,   # 7 days (168 hours)
+    slow_period: int = 720,   # 30 days (720 hours)
+    threshold: float = 0.005  # 0.5% buffer for sideways
+) -> TrendType:
     """
-    Proven mean reversion approach with fixed TP/SL.
+    Detect market trend based on price vs moving averages.
     
-    Entry Signals (LONG only in LOW vol):
-    - RSI crosses below oversold threshold (30)
-    - OR price crosses below lower Bollinger Band
-    - OR Z-score crosses below -2.0
+    Args:
+        current_price: Current close price
+        history: List of historical bars
+        fast_period: Short-term MA period (default 7 days)
+        slow_period: Long-term MA period (default 30 days)
+        threshold: Percentage buffer for sideways detection
     
-    Exit:
-    - Take profit: +2% from entry
-    - Stop loss: -1.5% from entry  
-    - Mean reversion: Price returns to BB middle
-    - Max holding: 24 bars
+    Returns:
+        'UPTREND', 'DOWNTREND', or 'SIDEWAYS'
+    """
+    if len(history) < slow_period:
+        return 'SIDEWAYS'  # Not enough data
+    
+    sma_fast = calculate_sma(history, fast_period)
+    sma_slow = calculate_sma(history, slow_period)
+    
+    if sma_fast is None or sma_slow is None:
+        return 'SIDEWAYS'
+    
+    # Conditions for uptrend
+    price_above_fast = current_price > sma_fast * (1 + threshold)
+    fast_above_slow = sma_fast > sma_slow * (1 + threshold)
+    
+    # Conditions for downtrend
+    price_below_fast = current_price < sma_fast * (1 - threshold)
+    fast_below_slow = sma_fast < sma_slow * (1 - threshold)
+    
+    if price_above_fast and fast_above_slow:
+        return 'UPTREND'
+    elif price_below_fast and fast_below_slow:
+        return 'DOWNTREND'
+    else:
+        return 'SIDEWAYS'
+
+
+def get_trend_strength(
+    current_price: float,
+    history: list[dict],
+    fast_period: int = 168,
+    slow_period: int = 720
+) -> float:
+    """
+    Calculate trend strength (-1 to +1).
+    
+    Returns:
+        -1.0 = Strong downtrend
+         0.0 = Sideways
+        +1.0 = Strong uptrend
+    """
+    if len(history) < slow_period:
+        return 0.0
+    
+    sma_fast = calculate_sma(history, fast_period)
+    sma_slow = calculate_sma(history, slow_period)
+    
+    if sma_fast is None or sma_slow is None:
+        return 0.0
+    
+    # Price deviation from fast MA (normalized)
+    price_dev = (current_price - sma_fast) / sma_fast
+    
+    # Fast MA deviation from slow MA (normalized)
+    ma_dev = (sma_fast - sma_slow) / sma_slow
+    
+    # Combined strength (clamped to -1, +1)
+    strength = (price_dev + ma_dev) / 2
+    return max(-1.0, min(1.0, strength * 10))  # Scale up for sensitivity
+```
+
+### Phase 3: Create Trend-Filtered Strategies
+
+#### Strategy 1: Trend-Filtered Mean Reversion
+
+Create `/backtest/strategies/trend_filtered_mr.py`:
+
+```python
+"""
+Trend-Filtered Mean Reversion Strategy V3.
+
+Key improvements over V2:
+1. Only trades LONG in UPTREND + LOW vol
+2. Only trades SHORT in DOWNTREND + LOW vol
+3. Stays flat in HIGH vol regardless of trend
+4. Uses crossover signals with fixed TP/SL
+"""
+
+from typing import Optional
+from .base import BaseStrategy, Signal
+from .trend_utils import detect_trend, get_trend_strength, TrendType
+
+
+class TrendFilteredMeanReversion(BaseStrategy):
+    """
+    Mean reversion strategy that only trades WITH the trend.
+    
+    Logic:
+    - UPTREND + LOW vol → LONG on RSI oversold
+    - DOWNTREND + LOW vol → SHORT on RSI overbought  
+    - SIDEWAYS + LOW vol → Trade both directions (cautious)
+    - HIGH vol → No trades / Exit
     """
     
     def __init__(
         self,
         rsi_oversold: float = 30,
         rsi_overbought: float = 70,
-        take_profit_pct: float = 0.02,  # 2%
-        stop_loss_pct: float = 0.015,   # 1.5%
+        take_profit_pct: float = 0.02,    # 2%
+        stop_loss_pct: float = 0.015,     # 1.5%
         max_holding_bars: int = 24,
-        min_bars_between_signals: int = 4,
-        trade_short: bool = True,  # Also trade shorts on overbought
+        fast_ma_period: int = 168,        # 7-day MA
+        slow_ma_period: int = 720,        # 30-day MA
+        trade_sideways: bool = False,     # Whether to trade in sideways market
+        min_trend_strength: float = 0.1,  # Minimum strength to consider trend
     ):
-        super().__init__(name="MeanReversionV2")
+        super().__init__(name="TrendFilteredMR")
         self.rsi_oversold = rsi_oversold
         self.rsi_overbought = rsi_overbought
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.max_holding_bars = max_holding_bars
-        self.min_bars_between = min_bars_between_signals
-        self.trade_short = trade_short
+        self.fast_ma_period = fast_ma_period
+        self.slow_ma_period = slow_ma_period
+        self.trade_sideways = trade_sideways
+        self.min_trend_strength = min_trend_strength
         
-        # Track state
-        self._prev_rsi = None
-        self._prev_bb_position = None
-        self._bars_since_signal = 999
-        self._entry_bar = None
+        # State tracking
+        self._prev_rsi: Optional[float] = None
+        self._bars_held: int = 0
+        self._current_trend: TrendType = 'SIDEWAYS'
     
     def generate_signal(
         self,
@@ -201,159 +241,181 @@ class MeanReversionV2Strategy(BaseStrategy):
         predicted_regime: str,
         history: list[dict]
     ) -> Signal:
-        """Generate mean reversion signal with crossover detection."""
+        """Generate trend-filtered mean reversion signal."""
         
         close = row.get('close', 0)
         rsi = row.get('rsi_14', 50)
-        bb_position = row.get('bb_position', 0.5)
         
-        self._bars_since_signal += 1
+        # Update bars held
+        if self.has_position():
+            self._bars_held += 1
+        else:
+            self._bars_held = 0
+        
+        # Detect trend (need enough history)
+        if len(history) >= self.slow_ma_period:
+            self._current_trend = detect_trend(
+                close, history, 
+                self.fast_ma_period, 
+                self.slow_ma_period
+            )
+            trend_strength = get_trend_strength(
+                close, history,
+                self.fast_ma_period,
+                self.slow_ma_period
+            )
+        else:
+            self._current_trend = 'SIDEWAYS'
+            trend_strength = 0.0
         
         # ========== EXIT LOGIC ==========
         if self.has_position():
             entry_price = self.position.entry_price
             direction = self.position.direction
-            bars_held = self._bars_since_signal
             
-            # Calculate current P&L
             if direction == 'LONG':
                 pnl_pct = (close - entry_price) / entry_price
             else:
                 pnl_pct = (entry_price - close) / entry_price
             
-            # Exit conditions (in priority order)
-            
             # 1. Take profit
             if pnl_pct >= self.take_profit_pct:
                 self._prev_rsi = rsi
-                self._prev_bb_position = bb_position
                 return 'CLOSE'
             
             # 2. Stop loss
             if pnl_pct <= -self.stop_loss_pct:
                 self._prev_rsi = rsi
-                self._prev_bb_position = bb_position
                 return 'CLOSE'
             
-            # 3. Mean reversion (price returned to middle BB)
-            if direction == 'LONG' and bb_position >= 0.45:
+            # 3. Exit on HIGH volatility
+            if predicted_regime == 'HIGH':
                 self._prev_rsi = rsi
-                self._prev_bb_position = bb_position
-                return 'CLOSE'
-            if direction == 'SHORT' and bb_position <= 0.55:
-                self._prev_rsi = rsi
-                self._prev_bb_position = bb_position
                 return 'CLOSE'
             
-            # 4. Max holding period
-            if bars_held >= self.max_holding_bars:
+            # 4. Exit if trend reverses against position
+            if direction == 'LONG' and self._current_trend == 'DOWNTREND':
                 self._prev_rsi = rsi
-                self._prev_bb_position = bb_position
+                return 'CLOSE'
+            if direction == 'SHORT' and self._current_trend == 'UPTREND':
+                self._prev_rsi = rsi
+                return 'CLOSE'
+            
+            # 5. Max holding period
+            if self._bars_held >= self.max_holding_bars:
+                self._prev_rsi = rsi
                 return 'CLOSE'
             
             self._prev_rsi = rsi
-            self._prev_bb_position = bb_position
             return 'HOLD'
         
         # ========== ENTRY LOGIC ==========
         
-        # Only enter in LOW volatility regime
+        # Only trade in LOW volatility
         if predicted_regime != 'LOW':
             self._prev_rsi = rsi
-            self._prev_bb_position = bb_position
             return 'HOLD'
         
-        # Respect minimum bars between signals
-        if self._bars_since_signal < self.min_bars_between:
+        # Need enough history for trend detection
+        if len(history) < self.slow_ma_period:
             self._prev_rsi = rsi
-            self._prev_bb_position = bb_position
             return 'HOLD'
         
-        signal = 'HOLD'
+        signal: Signal = 'HOLD'
         
-        # Detect CROSSOVERS (not just levels)
+        # Detect crossovers
         if self._prev_rsi is not None:
-            
-            # LONG: RSI crosses below oversold
             rsi_cross_down = (rsi < self.rsi_oversold and 
                              self._prev_rsi >= self.rsi_oversold)
+            rsi_cross_up = (rsi > self.rsi_overbought and 
+                          self._prev_rsi <= self.rsi_overbought)
             
-            # LONG: BB position crosses below lower band (0.0)
-            bb_cross_down = (bb_position < 0.0 and 
-                            self._prev_bb_position >= 0.0)
+            # LONG: Only in UPTREND or SIDEWAYS (if enabled)
+            if rsi_cross_down:
+                if self._current_trend == 'UPTREND':
+                    signal = 'BUY'
+                elif self._current_trend == 'SIDEWAYS' and self.trade_sideways:
+                    signal = 'BUY'
+                # No LONG in DOWNTREND
             
-            if rsi_cross_down or bb_cross_down:
-                signal = 'BUY'
-                self._bars_since_signal = 0
-            
-            # SHORT signals (if enabled)
-            if self.trade_short:
-                rsi_cross_up = (rsi > self.rsi_overbought and 
-                               self._prev_rsi <= self.rsi_overbought)
-                
-                bb_cross_up = (bb_position > 1.0 and 
-                              self._prev_bb_position <= 1.0)
-                
-                if rsi_cross_up or bb_cross_up:
+            # SHORT: Only in DOWNTREND or SIDEWAYS (if enabled)
+            if signal == 'HOLD' and rsi_cross_up:
+                if self._current_trend == 'DOWNTREND':
                     signal = 'SELL'
-                    self._bars_since_signal = 0
+                elif self._current_trend == 'SIDEWAYS' and self.trade_sideways:
+                    signal = 'SELL'
+                # No SHORT in UPTREND
         
         self._prev_rsi = rsi
-        self._prev_bb_position = bb_position
         return signal
     
     def get_params(self) -> dict:
         return {
-            'strategy': 'Mean Reversion V2',
-            'regime': 'LOW only',
+            'strategy': 'Trend-Filtered Mean Reversion V3',
+            'trend_filter': f'Fast MA: {self.fast_ma_period}h, Slow MA: {self.slow_ma_period}h',
             'rsi_oversold': self.rsi_oversold,
             'rsi_overbought': self.rsi_overbought,
-            'take_profit_pct': f"{self.take_profit_pct*100}%",
-            'stop_loss_pct': f"{self.stop_loss_pct*100}%",
+            'take_profit': f"{self.take_profit_pct*100}%",
+            'stop_loss': f"{self.stop_loss_pct*100}%",
             'max_holding_bars': self.max_holding_bars,
-            'trade_short': self.trade_short
+            'trade_sideways': self.trade_sideways
         }
     
     def reset(self):
         super().reset()
         self._prev_rsi = None
-        self._prev_bb_position = None
-        self._bars_since_signal = 999
-        self._entry_bar = None
+        self._bars_held = 0
+        self._current_trend = 'SIDEWAYS'
 ```
 
-### Step 3.2: Create Defensive Strategy
+#### Strategy 2: Trend-Adaptive Defensive
 
-Create `backtest/strategies/defensive.py`:
+Create `/backtest/strategies/trend_defensive.py`:
 
 ```python
 """
-Defensive Strategy - Use HIGH vol prediction to EXIT, not ENTER.
+Trend-Adaptive Defensive Strategy.
 
-Logic:
-- Hold a base LONG position during LOW volatility
-- Exit (go flat) when HIGH volatility is predicted
-- Re-enter when LOW volatility returns
-
-This exploits the fact that HIGH vol is dangerous (we lose money there)
-while LOW vol is safer for holding.
+Improvement over V2 Defensive:
+1. In UPTREND: Hold long during LOW vol, exit during HIGH vol (original defensive)
+2. In DOWNTREND: Stay flat entirely OR go short during LOW vol
+3. In SIDEWAYS: Reduced position size or flat
 """
 
-class DefensiveStrategy(BaseStrategy):
+from typing import Optional
+from .base import BaseStrategy, Signal
+from .trend_utils import detect_trend, TrendType
+
+
+class TrendAdaptiveDefensive(BaseStrategy):
     """
-    Use volatility prediction defensively.
+    Defensive strategy that adapts to the macro trend.
     
-    - LOW vol: Hold long position
-    - HIGH vol: Exit to cash (flat)
-    
-    This is essentially a "risk-off" toggle.
+    - UPTREND + LOW: Hold long
+    - UPTREND + HIGH: Exit to flat
+    - DOWNTREND: Stay flat (protect capital in bear market)
+    - SIDEWAYS + LOW: Optional cautious long
+    - SIDEWAYS + HIGH: Exit
     """
     
-    def __init__(self, reentry_delay: int = 2):
-        super().__init__(name="Defensive")
-        self.reentry_delay = reentry_delay  # Wait N bars after HIGH->LOW
-        self._bars_since_low = 0
-        self._prev_regime = None
+    def __init__(
+        self,
+        reentry_delay: int = 2,
+        fast_ma_period: int = 168,
+        slow_ma_period: int = 720,
+        trade_downtrend: bool = False,  # If True, short in downtrend
+        trade_sideways: bool = True,
+    ):
+        super().__init__(name="TrendDefensive")
+        self.reentry_delay = reentry_delay
+        self.fast_ma_period = fast_ma_period
+        self.slow_ma_period = slow_ma_period
+        self.trade_downtrend = trade_downtrend
+        self.trade_sideways = trade_sideways
+        
+        self._bars_since_low: int = 0
+        self._prev_regime: Optional[str] = None
+        self._current_trend: TrendType = 'SIDEWAYS'
     
     def generate_signal(
         self,
@@ -362,9 +424,9 @@ class DefensiveStrategy(BaseStrategy):
         history: list[dict]
     ) -> Signal:
         
-        # Track regime transitions
-        regime_just_changed = (self._prev_regime != predicted_regime)
+        close = row.get('close', 0)
         
+        # Track regime
         if predicted_regime == 'LOW':
             self._bars_since_low += 1
         else:
@@ -372,526 +434,530 @@ class DefensiveStrategy(BaseStrategy):
         
         self._prev_regime = predicted_regime
         
+        # Detect trend
+        if len(history) >= self.slow_ma_period:
+            self._current_trend = detect_trend(
+                close, history,
+                self.fast_ma_period,
+                self.slow_ma_period
+            )
+        else:
+            self._current_trend = 'SIDEWAYS'
+        
         # ========== HIGH VOLATILITY: EXIT ==========
         if predicted_regime == 'HIGH':
             if self.has_position():
                 return 'CLOSE'
             return 'HOLD'
         
-        # ========== LOW VOLATILITY: ENTER/HOLD ==========
+        # ========== LOW VOLATILITY ==========
         if predicted_regime == 'LOW':
-            # Wait for regime to stabilize
+            # Handle existing position
+            if self.has_position():
+                direction = self.position.direction
+                
+                # Exit LONG if trend turns down
+                if direction == 'LONG' and self._current_trend == 'DOWNTREND':
+                    return 'CLOSE'
+                
+                # Exit SHORT if trend turns up
+                if direction == 'SHORT' and self._current_trend == 'UPTREND':
+                    return 'CLOSE'
+                
+                return 'HOLD'
+            
+            # Consider new entry
             if self._bars_since_low < self.reentry_delay:
                 return 'HOLD'
             
-            # Enter if not in position
-            if not self.has_position():
+            # UPTREND: Go long
+            if self._current_trend == 'UPTREND':
                 return 'BUY'
             
-            return 'HOLD'
+            # DOWNTREND: Stay flat or short
+            if self._current_trend == 'DOWNTREND':
+                if self.trade_downtrend:
+                    return 'SELL'  # Short in downtrend
+                return 'HOLD'  # Stay flat (protect capital)
+            
+            # SIDEWAYS: Cautious long or flat
+            if self._current_trend == 'SIDEWAYS':
+                if self.trade_sideways:
+                    return 'BUY'
+                return 'HOLD'
         
         return 'HOLD'
     
     def get_params(self) -> dict:
         return {
-            'strategy': 'Defensive (Risk-Off Toggle)',
-            'logic': 'Long in LOW vol, Flat in HIGH vol',
-            'reentry_delay': self.reentry_delay
+            'strategy': 'Trend-Adaptive Defensive V3',
+            'trend_filter': f'Fast: {self.fast_ma_period}h, Slow: {self.slow_ma_period}h',
+            'reentry_delay': self.reentry_delay,
+            'trade_downtrend': self.trade_downtrend,
+            'trade_sideways': self.trade_sideways
         }
     
     def reset(self):
         super().reset()
         self._bars_since_low = 0
         self._prev_regime = None
+        self._current_trend = 'SIDEWAYS'
 ```
 
-### Step 3.3: Create Direction-Aware Strategy
+#### Strategy 3: Pure Trend Following (No Vol Filter)
 
-Create `backtest/strategies/direction_aware.py`:
+Create `/backtest/strategies/trend_follower.py`:
 
 ```python
 """
-Direction-Aware Mean Reversion Strategy.
+Pure Trend Following Strategy (for comparison).
 
-Uses BOTH volatility AND direction predictions:
-- LOW vol + UP direction → LONG mean reversion
-- LOW vol + DOWN direction → SHORT mean reversion  
-- HIGH vol → No trades (or exit)
+This strategy ignores volatility prediction and uses only trend.
+Useful for comparing: Is vol filtering adding value on top of trend?
 """
 
-class DirectionAwareMeanReversion(BaseStrategy):
+from typing import Optional
+from .base import BaseStrategy, Signal
+from .trend_utils import detect_trend, TrendType
+
+
+class TrendFollowerStrategy(BaseStrategy):
     """
-    Only trade when BOTH conditions are met:
-    1. LOW volatility predicted
-    2. Direction prediction matches trade direction
+    Pure trend following without volatility filter.
+    
+    - UPTREND: Hold long
+    - DOWNTREND: Hold short or flat
+    - SIDEWAYS: Flat
+    
+    Comparison baseline for trend + vol strategies.
     """
     
     def __init__(
         self,
-        rsi_oversold: float = 30,
-        rsi_overbought: float = 70,
-        take_profit_pct: float = 0.02,
-        stop_loss_pct: float = 0.015,
-        require_direction_confirmation: bool = True,
+        fast_ma_period: int = 168,
+        slow_ma_period: int = 720,
+        allow_short: bool = False,
     ):
-        super().__init__(name="DirectionAwareMR")
-        self.rsi_oversold = rsi_oversold
-        self.rsi_overbought = rsi_overbought
-        self.take_profit_pct = take_profit_pct
-        self.stop_loss_pct = stop_loss_pct
-        self.require_direction = require_direction_confirmation
-        self._prev_rsi = None
+        super().__init__(name="TrendFollower")
+        self.fast_ma_period = fast_ma_period
+        self.slow_ma_period = slow_ma_period
+        self.allow_short = allow_short
+        self._current_trend: TrendType = 'SIDEWAYS'
+        self._prev_trend: Optional[TrendType] = None
     
     def generate_signal(
         self,
         row: dict,
-        predicted_regime: str,
+        predicted_regime: str,  # Ignored
         history: list[dict]
     ) -> Signal:
-        """
-        Generate signal using both vol regime and direction.
         
-        Note: predicted_regime should now be like "LOW_UP" or "HIGH_DOWN"
-              Or pass direction separately in row['predicted_direction']
-        """
         close = row.get('close', 0)
-        rsi = row.get('rsi_14', 50)
         
-        # Parse combined regime or get direction separately
-        if '_' in predicted_regime:
-            vol_regime, direction = predicted_regime.split('_')
-        else:
-            vol_regime = predicted_regime
-            direction = row.get('predicted_direction', 'UNKNOWN')
+        if len(history) < self.slow_ma_period:
+            return 'HOLD'
         
-        # Exit logic (same as MeanReversionV2)
+        self._prev_trend = self._current_trend
+        self._current_trend = detect_trend(
+            close, history,
+            self.fast_ma_period,
+            self.slow_ma_period
+        )
+        
+        # Exit on trend change
         if self.has_position():
-            entry_price = self.position.entry_price
-            pos_direction = self.position.direction
+            direction = self.position.direction
             
-            if pos_direction == 'LONG':
-                pnl_pct = (close - entry_price) / entry_price
-            else:
-                pnl_pct = (entry_price - close) / entry_price
-            
-            if pnl_pct >= self.take_profit_pct:
+            if direction == 'LONG' and self._current_trend != 'UPTREND':
                 return 'CLOSE'
-            if pnl_pct <= -self.stop_loss_pct:
+            if direction == 'SHORT' and self._current_trend != 'DOWNTREND':
                 return 'CLOSE'
             
-            # Also exit if regime turns HIGH
-            if vol_regime == 'HIGH':
-                return 'CLOSE'
-            
-            self._prev_rsi = rsi
             return 'HOLD'
         
-        # Entry logic - only in LOW vol
-        if vol_regime != 'LOW':
-            self._prev_rsi = rsi
-            return 'HOLD'
+        # Entry
+        if self._current_trend == 'UPTREND':
+            return 'BUY'
         
-        signal = 'HOLD'
+        if self._current_trend == 'DOWNTREND' and self.allow_short:
+            return 'SELL'
         
-        if self._prev_rsi is not None:
-            # LONG signal
-            rsi_cross_down = (rsi < self.rsi_oversold and 
-                             self._prev_rsi >= self.rsi_oversold)
-            
-            if rsi_cross_down:
-                # Check direction confirmation
-                if not self.require_direction or direction == 'UP':
-                    signal = 'BUY'
-            
-            # SHORT signal
-            rsi_cross_up = (rsi > self.rsi_overbought and 
-                           self._prev_rsi <= self.rsi_overbought)
-            
-            if rsi_cross_up:
-                if not self.require_direction or direction == 'DOWN':
-                    signal = 'SELL'
-        
-        self._prev_rsi = rsi
-        return signal
+        return 'HOLD'
     
     def get_params(self) -> dict:
         return {
-            'strategy': 'Direction-Aware Mean Reversion',
-            'require_direction_confirmation': self.require_direction,
-            'take_profit': f"{self.take_profit_pct*100}%",
-            'stop_loss': f"{self.stop_loss_pct*100}%"
+            'strategy': 'Pure Trend Follower',
+            'fast_ma': self.fast_ma_period,
+            'slow_ma': self.slow_ma_period,
+            'allow_short': self.allow_short,
+            'vol_filter': 'NONE'
         }
     
     def reset(self):
         super().reset()
-        self._prev_rsi = None
+        self._current_trend = 'SIDEWAYS'
+        self._prev_trend = None
+```
+
+### Phase 4: Update Strategy Registry
+
+Add to `/backtest/strategies/__init__.py`:
+
+```python
+# V3 Strategies - Trend Filtered
+from .trend_utils import detect_trend, get_trend_strength, TrendType
+from .trend_filtered_mr import TrendFilteredMeanReversion
+from .trend_defensive import TrendAdaptiveDefensive
+from .trend_follower import TrendFollowerStrategy
+
+__all__ = [
+    # ... existing exports ...
+    # V3 Strategies
+    'detect_trend',
+    'get_trend_strength', 
+    'TrendType',
+    'TrendFilteredMeanReversion',
+    'TrendAdaptiveDefensive',
+    'TrendFollowerStrategy',
+]
+```
+
+### Phase 5: Create V3 Backtest Runner
+
+Create `/backtest/run_backtest_v3.py`:
+
+```python
+"""
+V3 Backtest Runner - Trend-Filtered Strategies
+
+Tests the hypothesis: Trend filter + Vol filter > Vol filter alone
+"""
+
+import os
+import sys
+import json
+import pandas as pd
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backtest.engine import BacktestEngine
+from backtest.analyze import generate_report
+from backtest.strategies import (
+    # Baselines
+    BuyAndHoldStrategy,
+    MeanReversionStrategy,
+    # V2 (Vol filter only)
+    MeanReversionV2Strategy,
+    DefensiveStrategy,
+    # V3 (Trend + Vol filter)
+    TrendFilteredMeanReversion,
+    TrendAdaptiveDefensive,
+    TrendFollowerStrategy,
+)
+
+# Configuration
+INITIAL_CAPITAL = 10000
+TRANSACTION_COST = 0.001
+SLIPPAGE = 0.0005
+
+DATA_PATH = "data/processed/features_365d.csv"
+CHECKPOINT_PATH = "checkpoints/best_regime_model_90d.pt"
+PREDICTIONS_PATH = "backtest/results_v3/test_predictions_90d.csv"
+RESULTS_DIR = "backtest/results_v3"
+
+
+def get_v3_strategies():
+    """All strategies for V3 comparison."""
+    return [
+        # === BASELINES ===
+        BuyAndHoldStrategy(),
+        
+        # === V2: Vol Filter Only ===
+        DefensiveStrategy(reentry_delay=2),
+        MeanReversionV2Strategy(
+            rsi_oversold=30,
+            take_profit_pct=0.02,
+            stop_loss_pct=0.015,
+            trade_short=True
+        ),
+        
+        # === V3: Trend Only (no vol filter) ===
+        TrendFollowerStrategy(
+            fast_ma_period=168,
+            slow_ma_period=720,
+            allow_short=False
+        ),
+        TrendFollowerStrategy(
+            fast_ma_period=168,
+            slow_ma_period=720,
+            allow_short=True
+        ),
+        
+        # === V3: Trend + Vol Filter ===
+        TrendFilteredMeanReversion(
+            rsi_oversold=30,
+            rsi_overbought=70,
+            take_profit_pct=0.02,
+            stop_loss_pct=0.015,
+            fast_ma_period=168,
+            slow_ma_period=720,
+            trade_sideways=False
+        ),
+        TrendFilteredMeanReversion(
+            rsi_oversold=30,
+            rsi_overbought=70,
+            take_profit_pct=0.02,
+            stop_loss_pct=0.015,
+            fast_ma_period=168,
+            slow_ma_period=720,
+            trade_sideways=True  # More aggressive
+        ),
+        TrendAdaptiveDefensive(
+            reentry_delay=2,
+            fast_ma_period=168,
+            slow_ma_period=720,
+            trade_downtrend=False,  # Stay flat in downtrend
+            trade_sideways=True
+        ),
+        TrendAdaptiveDefensive(
+            reentry_delay=2,
+            fast_ma_period=168,
+            slow_ma_period=720,
+            trade_downtrend=True,   # Short in downtrend
+            trade_sideways=False
+        ),
+    ]
+
+
+def run_v3_backtest():
+    """Run V3 backtest with trend-filtered strategies."""
+    
+    print("="*60)
+    print("BTC VOLATILITY STRATEGY V3 BACKTESTER")
+    print("Trend-Filtered Strategies")
+    print("="*60)
+    
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(f"{RESULTS_DIR}/trades", exist_ok=True)
+    
+    # Load predictions (reuse from V2)
+    if os.path.exists(PREDICTIONS_PATH):
+        predictions_df = pd.read_csv(PREDICTIONS_PATH)
+    else:
+        print(f"ERROR: Predictions not found at {PREDICTIONS_PATH}")
+        print("Run V2 backtest first to generate predictions.")
+        return
+    
+    print(f"Loaded {len(predictions_df)} samples ({len(predictions_df)/24:.0f} days)")
+    
+    engine = BacktestEngine(
+        initial_capital=INITIAL_CAPITAL,
+        transaction_cost=TRANSACTION_COST,
+        slippage=SLIPPAGE
+    )
+    
+    strategies = get_v3_strategies()
+    results = []
+    
+    print("\n" + "="*60)
+    print("RUNNING V3 BACKTESTS")
+    print("="*60)
+    
+    for i, strategy in enumerate(strategies):
+        print(f"\n[{i+1}/{len(strategies)}] {strategy.name}")
+        print(f"   Params: {strategy.get_params()}")
+        
+        result = engine.run(strategy, predictions_df)
+        results.append(result)
+        
+        if result.num_trades > 0:
+            engine.save_trades(result, f"{RESULTS_DIR}/trades")
+        
+        print(f"   Return: {result.total_return*100:+.2f}%")
+        print(f"   Sharpe: {result.sharpe_ratio:.2f}")
+        print(f"   MaxDD:  {result.max_drawdown*100:.1f}%")
+        print(f"   Trades: {result.num_trades}")
+        if result.num_trades > 0:
+            print(f"   WinRate: {result.win_rate*100:.1f}%")
+    
+    # Compare V2 vs V3
+    print("\n" + "="*60)
+    print("V2 vs V3 COMPARISON")
+    print("="*60)
+    
+    # Find key strategies
+    buy_hold = next((r for r in results if r.strategy_name == "BuyAndHold"), None)
+    defensive_v2 = next((r for r in results if r.strategy_name == "Defensive"), None)
+    trend_defensive = [r for r in results if "TrendDefensive" in r.strategy_name]
+    trend_mr = [r for r in results if "TrendFilteredMR" in r.strategy_name]
+    
+    if buy_hold:
+        print(f"\nBuy & Hold: {buy_hold.total_return*100:+.2f}%")
+    
+    if defensive_v2:
+        print(f"Defensive V2 (Vol Only): {defensive_v2.total_return*100:+.2f}%")
+    
+    print("\nTrend-Filtered Strategies:")
+    for r in trend_defensive + trend_mr:
+        print(f"  {r.strategy_name}: {r.total_return*100:+.2f}% (Sharpe: {r.sharpe_ratio:.2f})")
+    
+    # Generate report
+    try:
+        generate_report(results, predictions_df, RESULTS_DIR)
+    except Exception as e:
+        print(f"Warning: Could not generate full report: {e}")
+    
+    # Save summary
+    summary = []
+    for r in results:
+        summary.append({
+            'strategy': r.strategy_name,
+            'return_pct': r.total_return * 100,
+            'sharpe': r.sharpe_ratio,
+            'max_dd_pct': r.max_drawdown * 100,
+            'win_rate': r.win_rate * 100 if r.num_trades > 0 else 0,
+            'num_trades': r.num_trades,
+            'profit_factor': r.profit_factor
+        })
+    
+    pd.DataFrame(summary).to_csv(f"{RESULTS_DIR}/summary_v3.csv", index=False)
+    
+    # Best strategy
+    best = max(results, key=lambda r: r.sharpe_ratio)
+    print(f"\nBest Strategy: {best.strategy_name}")
+    print(f"  Return: {best.total_return*100:+.2f}%")
+    print(f"  Sharpe: {best.sharpe_ratio:.2f}")
+    
+    print(f"\nResults saved to {RESULTS_DIR}/")
+
+
+if __name__ == "__main__":
+    run_v3_backtest()
 ```
 
 ---
 
-## Phase 4: Update Backtest Engine
+## Execution Steps
 
-### Step 4.1: Fix Engine to Handle TP/SL Properly
-
-The current engine doesn't properly handle percentage-based TP/SL. Update `backtest/engine.py`:
-
-```python
-# Add to BacktestEngine.run():
-
-# Inside the main loop, after getting signal:
-if signal == 'BUY' or signal == 'SELL':
-    # Record entry for TP/SL calculation
-    position.entry_price = close
-    position.entry_bar = i
-
-# When checking position status:
-if position is not None:
-    # Let strategy handle TP/SL internally via generate_signal
-    # The strategy returns 'CLOSE' when TP/SL is hit
-    pass
-```
-
-### Step 4.2: Add Trade Analysis by Signal Type
-
-```python
-# In BacktestResult, add:
-@dataclass
-class BacktestResult:
-    # ... existing fields ...
-    trades_by_signal_type: dict = field(default_factory=dict)
-    trades_by_exit_reason: dict = field(default_factory=dict)
-```
-
----
-
-## Phase 5: Execution Plan
-
-### 5.1: File Structure to Create/Modify
-
-```
-btc_volatility_predictor/
-├── INSTRUCTIONS_V2.md              # This file
-├── fetch_extended_data.py          # NEW: Fetch 365 days
-├── data/
-│   ├── raw/
-│   │   └── btcusdt_1h_365d.csv    # NEW: Extended data
-│   └── processed/
-│       └── features_365d.csv       # NEW: Extended features
-├── train_regime_extended.py        # NEW: Train with 90-day test
-├── train_direction.py              # NEW: Direction classifier
-├── checkpoints/
-│   ├── best_regime_model_90d.pt   # NEW: Extended model
-│   └── best_direction_model.pt    # NEW: Direction model
-├── backtest/
-│   ├── strategies/
-│   │   ├── mean_reversion_v2.py   # NEW: Proven approach
-│   │   ├── defensive.py           # NEW: Risk-off toggle
-│   │   └── direction_aware.py     # NEW: Combined predictor
-│   ├── engine.py                   # MODIFY: Better TP/SL handling
-│   └── run_backtest_v2.py         # NEW: Extended backtest runner
-└── combined_predictor.py           # NEW: Vol + Direction
-```
-
-### 5.2: Execution Commands (In Order)
+### Step 1: Ensure V2 Prerequisites
 
 ```bash
-# ============================================
-# PHASE 1: DATA & MODEL
-# ============================================
-
-# Step 1: Fetch extended data (365 days)
 cd btc_volatility_predictor
+
+# Check if V2 data and models exist
+ls -la data/processed/features_365d.csv
+ls -la checkpoints/best_regime_model_90d.pt
+ls -la backtest/results_v2/test_predictions_90d.csv
+```
+
+If missing, run V2 first:
+```bash
 python fetch_extended_data.py
-
-# Step 2: Engineer features
-python -c "
-from data.features import prepare_dataset
-prepare_dataset('data/raw/btcusdt_1h_365d.csv', 'data/processed/features_365d.csv')
-"
-
-# Step 3: Train regime model with 90-day test
+python -c "from data.features import prepare_dataset; prepare_dataset('data/raw/btcusdt_1h_365d.csv', 'data/processed/features_365d.csv')"
 python train_regime_extended.py
-
-# ============================================
-# PHASE 2: DIRECTION MODEL (Optional but recommended)
-# ============================================
-
-# Step 4: Train direction classifier
-python train_direction.py
-
-# ============================================
-# PHASE 3: BACKTEST
-# ============================================
-
-# Step 5: Run extended backtest
 python backtest/run_backtest_v2.py
+```
 
-# ============================================
-# PHASE 4: ANALYZE
-# ============================================
+### Step 2: Create V3 Files
 
-# Results will be in backtest/results_v2/
+```bash
+# Create trend utilities
+cat > backtest/strategies/trend_utils.py << 'EOF'
+# ... paste trend_utils.py content ...
+EOF
+
+# Create trend-filtered strategies
+cat > backtest/strategies/trend_filtered_mr.py << 'EOF'
+# ... paste trend_filtered_mr.py content ...
+EOF
+
+cat > backtest/strategies/trend_defensive.py << 'EOF'
+# ... paste trend_defensive.py content ...
+EOF
+
+cat > backtest/strategies/trend_follower.py << 'EOF'
+# ... paste trend_follower.py content ...
+EOF
+
+# Update __init__.py
+# Add V3 imports to backtest/strategies/__init__.py
+
+# Create V3 runner
+cat > backtest/run_backtest_v3.py << 'EOF'
+# ... paste run_backtest_v3.py content ...
+EOF
+```
+
+### Step 3: Run V3 Backtest
+
+```bash
+python backtest/run_backtest_v3.py
 ```
 
 ---
 
-## Phase 6: Expected Outcomes
+## Expected Results
 
-### Based on `vol_filtered_mean_reversion_v2.py` Results
+### Hypothesis
 
-The proven approach achieved:
-- **Unfiltered**: ~50-60% win rate
-- **Vol-Filtered (LOW only)**: ~69% win rate
-- **Return improvement**: From ~0% to +39.90%
-- **Sharpe improvement**: From ~0 to 9.73
-
-### What We Expect to See
-
-| Strategy | Expected Outcome |
-|----------|-----------------|
-| MeanReversionV2 (LOW only) | +10-30% return, 60-70% win rate |
-| Defensive (risk-off toggle) | Beat buy-and-hold with lower DD |
-| DirectionAware | Highest Sharpe if direction model works |
-| OLD strategies (HIGH vol) | Still negative (confirms our learning) |
+| Strategy Type | Expected in Bear Market | Expected in Bull Market |
+|--------------|-------------------------|-------------------------|
+| Buy & Hold | -20% to -30% | +20% to +50% |
+| Vol Filter Only (V2) | -2% to -5% | +5% to +15% |
+| Trend Only (No Vol) | -5% to +5% | +15% to +30% |
+| **Trend + Vol (V3)** | **-2% to +5%** | **+20% to +40%** |
 
 ### Success Criteria
 
-1. **MeanReversionV2 is profitable** (>0% return over 90 days)
-2. **Sharpe ratio > 1.0** for best strategy
-3. **Max drawdown < 15%**
-4. **At least 50+ trades** for statistical significance
-5. **Vol filtering shows clear improvement** over unfiltered
+1. **Trend-filtered strategies outperform Buy & Hold** in bear market
+2. **V3 outperforms V2** in terms of Sharpe ratio
+3. **TrendAdaptiveDefensive** with `trade_downtrend=False` should have lowest drawdown
+4. **TrendFilteredMR** should have better risk-adjusted returns than MeanReversionV2
 
 ---
 
-## Phase 7: Key Code Snippets
+## Key Insights from V2 → V3
 
-### 7.1: Modified Data Split (90 Days Test)
-
-```python
-# train_regime_extended.py
-
-def create_regime_dataloaders_extended(
-    data_path="data/processed/features_365d.csv",
-    window_size=48,
-    batch_size=32,
-    test_days=90,        # CHANGED: 90 days = 2160 hours
-    val_ratio=0.15,
-    percentile=50
-):
-    """Create dataloaders with 90-day test period."""
-    df = pd.read_csv(data_path)
-    
-    n_total = len(df)
-    n_test = test_days * 24  # 2160 hours
-    n_trainval = n_total - n_test
-    n_val = int(n_trainval * 0.15)
-    n_train = n_trainval - n_val
-    
-    print(f"Total: {n_total} samples ({n_total/24:.0f} days)")
-    print(f"Train: {n_train} ({n_train/24:.0f} days)")
-    print(f"Val: {n_val} ({n_val/24:.0f} days)")
-    print(f"Test: {n_test} ({n_test/24:.0f} days)")  # 90 days
-    
-    # ... rest same as original
-```
-
-### 7.2: Direction Classifier Training
-
-```python
-# train_direction.py
-
-"""
-Train direction classifier: Will next hour be UP or DOWN?
-"""
-
-import torch
-import torch.nn as nn
-import pandas as pd
-import numpy as np
-from config import Config
-from models import SPHNet
-
-def create_direction_labels(df: pd.DataFrame) -> np.ndarray:
-    """
-    Create binary direction labels.
-    1 = next close > current close (UP)
-    0 = next close <= current close (DOWN)
-    """
-    next_close = df['close'].shift(-1)
-    current_close = df['close']
-    direction = (next_close > current_close).astype(int)
-    return direction.values
-
-def main():
-    config = Config()
-    config.data_path = "data/processed/features_365d.csv"
-    
-    # Load data
-    df = pd.read_csv(config.data_path)
-    
-    # Create direction labels
-    df['target_direction_binary'] = create_direction_labels(df)
-    
-    # ... rest similar to train_regime.py but predicting direction
-    
-    # Save model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': config.__dict__
-    }, "checkpoints/best_direction_model.pt")
-
-if __name__ == "__main__":
-    main()
-```
-
-### 7.3: Combined Predictor
-
-```python
-# combined_predictor.py
-
-"""
-Combined volatility regime + direction predictor.
-"""
-
-import torch
-from config import Config
-from models import SPHNet
-
-class CombinedPredictor:
-    """
-    Predicts both volatility regime and price direction.
-    
-    Returns: {
-        'vol_regime': 'HIGH' or 'LOW',
-        'direction': 'UP' or 'DOWN',
-        'combined': 'LOW_UP', 'LOW_DOWN', 'HIGH_UP', or 'HIGH_DOWN',
-        'vol_prob': float,
-        'dir_prob': float
-    }
-    """
-    
-    def __init__(
-        self,
-        vol_checkpoint="checkpoints/best_regime_model_90d.pt",
-        dir_checkpoint="checkpoints/best_direction_model.pt",
-        device='cpu'
-    ):
-        self.device = torch.device(device)
-        
-        # Load volatility model
-        self.vol_model = self._load_model(vol_checkpoint)
-        
-        # Load direction model
-        self.dir_model = self._load_model(dir_checkpoint)
-    
-    def _load_model(self, checkpoint_path):
-        config = Config()
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
-        if 'config' in checkpoint:
-            for k, v in checkpoint['config'].items():
-                if hasattr(config, k):
-                    setattr(config, k, v)
-        
-        model = SPHNet(config).to(self.device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        return model
-    
-    @torch.no_grad()
-    def predict(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
-        """
-        Predict both regime and direction.
-        
-        Args:
-            prices: [1, window_size, n_price_features]
-            features: [1, window_size, n_eng_features]
-        """
-        # Volatility prediction
-        vol_out = self.vol_model(prices, features)
-        vol_prob = torch.sigmoid(vol_out['direction_pred']).item()
-        vol_regime = 'HIGH' if vol_prob > 0.5 else 'LOW'
-        
-        # Direction prediction
-        dir_out = self.dir_model(prices, features)
-        dir_prob = torch.sigmoid(dir_out['direction_pred']).item()
-        direction = 'UP' if dir_prob > 0.5 else 'DOWN'
-        
-        return {
-            'vol_regime': vol_regime,
-            'direction': direction,
-            'combined': f"{vol_regime}_{direction}",
-            'vol_prob': vol_prob,
-            'dir_prob': dir_prob,
-            'vol_confidence': abs(vol_prob - 0.5) * 2,
-            'dir_confidence': abs(dir_prob - 0.5) * 2
-        }
-```
+| V2 Finding | V3 Response |
+|------------|-------------|
+| Direction prediction = 49.8% | Use trend (168/720h MA) instead |
+| All LONG strategies lost in bear market | Only LONG in uptrend, flat/short in downtrend |
+| Defensive beat market by 20% | Add trend awareness to defensive |
+| Vol filtering improved returns by 14% | Keep vol filter, add trend layer |
 
 ---
 
-## Appendix: Quick Reference
+## Parameter Tuning Guidelines
 
-### A. Data Requirements
+### Trend Detection Parameters
 
-| Item | Current | Required |
-|------|---------|----------|
-| Data days | 173 | 365 |
-| Test days | 10 | 90 |
-| Test samples | 240 | 2160 |
-| Min trades for significance | ~10 | ~100 |
+| Parameter | Conservative | Balanced | Aggressive |
+|-----------|--------------|----------|------------|
+| fast_ma_period | 336 (14d) | 168 (7d) | 72 (3d) |
+| slow_ma_period | 1440 (60d) | 720 (30d) | 336 (14d) |
+| threshold | 0.01 | 0.005 | 0.002 |
 
-### B. Strategy Decision Matrix
+### Strategy Parameters
 
-| Vol Regime | Direction | Action |
-|------------|-----------|--------|
-| LOW | UP | LONG mean reversion |
-| LOW | DOWN | SHORT mean reversion |
-| HIGH | UP | NO TRADE (or cautious trend follow) |
-| HIGH | DOWN | NO TRADE (or exit existing) |
-
-### C. Key Parameters to Test
-
-```python
-# Mean Reversion V2 parameters to grid search:
-rsi_oversold = [25, 30, 35]
-take_profit_pct = [0.015, 0.02, 0.025]
-stop_loss_pct = [0.01, 0.015, 0.02]
-max_holding_bars = [12, 24, 48]
-```
-
-### D. Risk Management Rules
-
-1. **Max position size**: 100% (single trade at a time)
-2. **Max daily loss**: -2% of capital → stop trading for day
-3. **Max drawdown**: -15% → reduce position size to 50%
-4. **Minimum bars between trades**: 4 hours
+| Parameter | Safe | Balanced | Aggressive |
+|-----------|------|----------|------------|
+| trade_sideways | False | True | True |
+| trade_downtrend | False | False | True (short) |
+| take_profit_pct | 0.015 | 0.02 | 0.03 |
+| stop_loss_pct | 0.01 | 0.015 | 0.02 |
 
 ---
 
 ## Summary
 
-**Do This**:
-1. Fetch 365 days of data
-2. Retrain with 90-day test split
-3. Train separate direction model
-4. Implement MeanReversionV2 (LOW vol only, fixed TP/SL)
-5. Implement Defensive strategy (exit on HIGH vol)
-6. Run extended backtest
-7. Compare filtered vs unfiltered results
+V3 addresses the core problem discovered in V2:
+- **Problem**: Can't predict hour-by-hour direction
+- **Solution**: Use macro trend (7-day / 30-day MA) instead
+- **Result**: Trade WITH the trend, not against it
 
-**Don't Do This**:
-- Trade breakout/momentum in HIGH volatility
-- Use indicator-based exits without TP/SL
-- Test on < 30 days (not statistically significant)
-- Ignore the proven approach from vol_filtered_mean_reversion_v2.py
+The combination of:
+1. **Volatility filter** (75.7% accurate) → Avoid HIGH vol
+2. **Trend filter** (not prediction, just detection) → Trade WITH trend
 
-**Expected Result**: 
-- MeanReversionV2 should show +10-40% return over 90 days
-- Defensive strategy should beat buy-and-hold with lower drawdown
-- Clear evidence that vol filtering adds value
-
----
-
-*Last Updated: Created for Claude Code Opus Implementation*
+Should produce the most robust strategy for varying market conditions.
