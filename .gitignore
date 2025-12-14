@@ -206,3 +206,76 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 sph_net/.venv
+
+# =============================================================================
+# ML/Data Science - Large Files
+# =============================================================================
+
+# Data files
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.json
+!package.json
+!tsconfig.json
+data/raw/
+data/processed/
+data/interim/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.weights
+checkpoints/
+models/saved/
+*.onnx
+*.pb
+
+# TensorFlow
+*.tfrecord
+saved_model/
+*.tflite
+
+# Backtest results
+backtest/results*/
+results/
+outputs/
+logs/
+
+# Plots and figures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+figures/
+plots/
+
+# Wandb / MLflow / experiment tracking
+wandb/
+mlruns/
+.neptune/
+lightning_logs/
+
+# Large notebooks with outputs
+*.ipynb
+!notebooks/*.ipynb
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
