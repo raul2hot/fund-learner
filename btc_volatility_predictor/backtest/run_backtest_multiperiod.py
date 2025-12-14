@@ -381,6 +381,9 @@ def train_volatility_model(
         config = Config()
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        if verbose:
+            print(f"    Using device: {device}")
+
         # Create datasets
         train_dataset = VolatilityRegimeDataset(
             train_df,
@@ -396,6 +399,13 @@ def train_volatility_model(
             feature_scaler=train_dataset.feature_scaler,
             vol_threshold=train_dataset.vol_threshold
         )
+
+        if verbose:
+            print(f"    Volatility threshold (p50): {train_dataset.vol_threshold:.6f}")
+            print(f"    Train samples: {len(train_dataset)}, Val: {len(val_dataset)}")
+            # Check class balance
+            train_pos = train_dataset.targets[train_dataset.window_size:].mean()
+            print(f"    Train class balance: {train_pos:.1%} high volatility")
 
         if len(train_dataset) < 100:
             if verbose:
@@ -418,6 +428,9 @@ def train_volatility_model(
         # Create model with config object
         model = SPHNet(config).to(device)
 
+        if verbose:
+            print(f"    Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
         # Use config values like train_regime_extended.py
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -432,9 +445,6 @@ def train_volatility_model(
         patience = config.patience
         patience_counter = 0
         max_epochs = config.epochs
-
-        if verbose:
-            print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
         for epoch in range(max_epochs):
             model.train()
@@ -773,14 +783,15 @@ def train_period_model(
 # WALK-FORWARD OPTIMIZATION
 # =============================================================================
 
-def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = True) -> Dict:
+def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = True,
+                      test_days: int = 90, val_ratio: float = 0.15) -> Dict:
     """
     Walk-forward analysis with proper model training on each period.
 
-    Split:
-    - Train: First 70% of data (used for model training)
-    - Validate: Next 15% of data (used for early stopping)
-    - Test: Final 15% of data (out-of-sample evaluation)
+    Split (matching train_regime_extended.py):
+    - Test: Last test_days days (fixed, for statistical significance)
+    - Val: val_ratio of (total - test)
+    - Train: remainder
 
     For each period:
     1. Train SPHNet volatility model on training data
@@ -793,23 +804,27 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         df: DataFrame with features
         period_name: Name of the period for logging
         train_model: Whether to train new models (True) or use existing
+        test_days: Number of days for test set (default 90)
+        val_ratio: Ratio of train+val for validation (default 0.15)
 
     Returns:
         Dict with walk-forward results
     """
     n = len(df)
-    n_train = int(n * 0.70)
-    n_val = int(n * 0.15)
-    n_test = n - n_train - n_val
+    n_test = test_days * 24  # Convert days to hours
+    n_trainval = n - n_test
+    n_val = int(n_trainval * val_ratio)
+    n_train = n_trainval - n_val
 
     train_df = df.iloc[:n_train].reset_index(drop=True)
     val_df = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
     test_df = df.iloc[n_train + n_val:].reset_index(drop=True)
 
     print(f"\n  Walk-Forward Split for {period_name}:")
-    print(f"    Train: {n_train} samples ({n_train/24:.0f} days)")
-    print(f"    Val:   {n_val} samples ({n_val/24:.0f} days)")
-    print(f"    Test:  {n_test} samples ({n_test/24:.0f} days)")
+    print(f"    Total: {n} samples ({n/24:.0f} days)")
+    print(f"    Train: {n_train} ({n_train/24:.0f} days)")
+    print(f"    Val:   {n_val} ({n_val/24:.0f} days)")
+    print(f"    Test:  {n_test} ({n_test/24:.0f} days)")
 
     results = {
         'train_samples': n_train,
