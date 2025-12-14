@@ -419,15 +419,16 @@ def train_volatility_model(
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        # Training loop (simplified)
+        # Training loop (simplified, reduced epochs for faster testing)
         best_val_loss = float('inf')
-        patience = 10
+        patience = 5  # Reduced patience for faster convergence
         patience_counter = 0
+        max_epochs = 20  # Reduced from 50 for faster training
 
         if verbose:
             print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
-        for epoch in range(50):  # Max epochs
+        for epoch in range(max_epochs):
             model.train()
             train_loss = 0
             for batch in train_loader:
@@ -458,6 +459,10 @@ def train_volatility_model(
 
             val_loss /= len(val_loader)
 
+            # Progress logging every 5 epochs
+            if verbose and (epoch + 1) % 5 == 0:
+                print(f"      Epoch {epoch+1}/{max_epochs}: val_loss={val_loss:.4f}, best={best_val_loss:.4f}")
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -474,6 +479,8 @@ def train_volatility_model(
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
+                    if verbose:
+                        print(f"      Early stopping at epoch {epoch+1}")
                     break
 
         if verbose:
