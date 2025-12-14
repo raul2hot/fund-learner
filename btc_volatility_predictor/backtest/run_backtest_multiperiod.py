@@ -869,6 +869,7 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
 
     # Step 1: Train SPHNet volatility model on training data
     sphnet_path = None
+    vol_threshold = None  # For threshold-based fallback
     if train_model and SPHNET_AVAILABLE:
         print(f"\n  Step 1: Training SPHNet volatility model...")
         sphnet_path = train_volatility_model(train_df, val_df, period_name)
@@ -880,9 +881,16 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         train_df_with_regime = generate_regime_predictions_with_model(train_df, sphnet_path)
         val_df_with_regime = generate_regime_predictions_with_model(val_df, sphnet_path)
     else:
-        # Clean data even when using threshold-based predictions
-        train_df_with_regime = prepare_regime_predictions(clean_dataframe_for_ml(train_df))
-        val_df_with_regime = prepare_regime_predictions(clean_dataframe_for_ml(val_df))
+        # Calculate volatility threshold from TRAINING data only (for consistency across splits)
+        train_df_clean = clean_dataframe_for_ml(train_df)
+        vol_cols = ['target_volatility', 'vol_realized_24h', 'vol_gk_24h']
+        for col in vol_cols:
+            if col in train_df_clean.columns:
+                vol_threshold = train_df_clean[col].median()
+                print(f"  Using volatility threshold from training data: {vol_threshold:.6f} ({col})")
+                break
+        train_df_with_regime = prepare_regime_predictions(train_df_clean, vol_threshold=vol_threshold)
+        val_df_with_regime = prepare_regime_predictions(clean_dataframe_for_ml(val_df), vol_threshold=vol_threshold)
 
     # Step 3: Train XGBoost on training data with regime predictions
     xgb_model_path = None
@@ -907,11 +915,11 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
             results['splits'][split_name] = {'error': 'Insufficient data'}
             continue
 
-        # Generate regime predictions using trained SPHNet (or threshold)
+        # Generate regime predictions using trained SPHNet (or threshold from training data)
         if sphnet_path:
             split_df = generate_regime_predictions_with_model(split_df, sphnet_path)
         else:
-            split_df = prepare_regime_predictions(clean_dataframe_for_ml(split_df))
+            split_df = prepare_regime_predictions(clean_dataframe_for_ml(split_df), vol_threshold=vol_threshold)
 
         # Create strategy with period-specific XGBoost model if available
         if xgb_model_path and os.path.exists(xgb_model_path):
@@ -944,7 +952,7 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
 # DATA PREPARATION
 # =============================================================================
 
-def prepare_regime_predictions(df: pd.DataFrame) -> pd.DataFrame:
+def prepare_regime_predictions(df: pd.DataFrame, vol_threshold: Optional[float] = None) -> pd.DataFrame:
     """
     Prepare volatility regime predictions if not present.
 
@@ -952,6 +960,7 @@ def prepare_regime_predictions(df: pd.DataFrame) -> pd.DataFrame:
 
     Args:
         df: DataFrame with features
+        vol_threshold: Optional pre-computed threshold (for consistency across splits)
 
     Returns:
         DataFrame with predicted_regime column
@@ -969,7 +978,8 @@ def prepare_regime_predictions(df: pd.DataFrame) -> pd.DataFrame:
                 break
 
         if vol_col:
-            threshold = df[vol_col].median()
+            # Use provided threshold or calculate from this df's median
+            threshold = vol_threshold if vol_threshold is not None else df[vol_col].median()
             df['predicted_regime'] = (df[vol_col] > threshold).astype(int)
         else:
             # Fallback: all LOW volatility
