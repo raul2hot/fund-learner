@@ -1501,6 +1501,8 @@ def main():
                         help='Run walk-forward testing with period-specific model training')
     parser.add_argument('--no-train', action='store_true',
                         help='Skip model training in walk-forward mode (use existing models)')
+    parser.add_argument('--test-full', action='store_true',
+                        help='Test on full data (like run_backtest_v5.py) instead of walk-forward splits')
 
     args = parser.parse_args()
 
@@ -1508,6 +1510,54 @@ def main():
     if args.last_365d:
         args.period = 'last_365d'
         args.walk_forward = True
+
+    # Handle --test-full: test on FULL data like run_backtest_v5.py
+    if args.test_full and args.period:
+        print(f"\n{'='*60}")
+        print(f"FULL DATA TEST: {args.period.upper()} (like run_backtest_v5.py)")
+        print(f"{'='*60}")
+
+        config = PERIODS[args.period]
+        data_path = config['path']
+        if not os.path.isabs(data_path):
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            data_path = os.path.join(base_dir, data_path)
+
+        if not os.path.exists(data_path):
+            print(f"ERROR: Data not found at {data_path}")
+            return
+
+        df = pd.read_csv(data_path)
+        print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
+        print(f"Description: {config['description']}")
+
+        # Clean and prepare data
+        df = clean_dataframe_for_ml(df)
+        df = prepare_regime_predictions(df)  # Uses full data median like v5
+
+        # Run strategy on FULL data (exactly like run_backtest_v5.py)
+        engine = BacktestEngine(
+            initial_capital=INITIAL_CAPITAL,
+            transaction_cost=TRANSACTION_COST,
+            slippage=SLIPPAGE
+        )
+
+        strategy = TrendStrengthWithML(ml_threshold=0.5)
+        result = engine.run(strategy, df)
+
+        print(f"\nResults (Full {len(df)/24:.0f} days):")
+        print(f"  Return:     {result.total_return*100:+.2f}%")
+        print(f"  Sharpe:     {result.sharpe_ratio:.2f}")
+        print(f"  Trades:     {result.num_trades}")
+        print(f"  Win Rate:   {result.win_rate*100:.1f}%")
+        print(f"  Max DD:     {result.max_drawdown*100:.1f}%")
+        if hasattr(strategy, 'get_ml_stats'):
+            stats = strategy.get_ml_stats()
+            print(f"\nML Filter Stats:")
+            print(f"  Trades allowed: {stats['ml_allows']}")
+            print(f"  Trades blocked: {stats['ml_blocks']}")
+            print(f"  Filter rate:    {stats['ml_filter_rate']*100:.1f}%")
+        return
 
     if args.walk_forward:
         if args.period:
