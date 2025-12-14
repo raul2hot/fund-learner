@@ -13,8 +13,17 @@ Fixes:
 4. Fallback if ADX not available
 """
 
+import os
+import sys
+
+# Handle both direct execution and module import
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from backtest.strategies.base import BaseStrategy, Signal
+else:
+    from .base import BaseStrategy, Signal
+
 from typing import Optional
-from .base import BaseStrategy, Signal
 
 
 def simple_trend(close: float, history: list[dict], fast: int = 72, slow: int = 168) -> str:
@@ -369,11 +378,7 @@ class VolTrendCombo(BaseStrategy):
 
 def run_v4_simplified():
     """Run simplified V4 strategies."""
-    import os
-    import sys
     import pandas as pd
-
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     from backtest.engine import BacktestEngine
     from backtest.strategies import BuyAndHoldStrategy, DefensiveStrategy
