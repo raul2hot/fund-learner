@@ -273,6 +273,71 @@ def generate_random_windows(
 # WALK-FORWARD VOLATILITY MODEL TRAINING
 # =============================================================================
 
+def clean_dataframe_for_ml(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean DataFrame for ML training by handling inf/NaN values.
+
+    This ensures data is compatible with float32 and sklearn scalers.
+
+    Args:
+        df: Input DataFrame
+
+    Returns:
+        Cleaned DataFrame with no inf/NaN values and reasonable ranges
+    """
+    df = df.copy()
+
+    # Replace inf with NaN first
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # Get numeric columns (exclude timestamp-like columns)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    exclude_cols = ['timestamp', 'open_time', 'close_time', 'unix_time']
+    numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+
+    # For numeric columns, fill NaN with column median
+    for col in numeric_cols:
+        if df[col].isna().any():
+            # Calculate median of non-NaN values
+            valid_values = df[col].dropna()
+            if len(valid_values) > 0:
+                median_val = valid_values.median()
+            else:
+                median_val = 0.0
+            df[col] = df[col].fillna(median_val)
+
+    # Clip extreme values to prevent float32 overflow
+    # Use 1st and 99th percentile but ensure they're valid
+    for col in numeric_cols:
+        col_data = df[col]
+        if len(col_data) == 0:
+            continue
+
+        # Calculate percentiles
+        q01 = col_data.quantile(0.01)
+        q99 = col_data.quantile(0.99)
+
+        # Handle case where percentiles are NaN or equal
+        if pd.isna(q01) or pd.isna(q99):
+            q01, q99 = col_data.min(), col_data.max()
+        if q01 == q99:
+            continue  # Skip if no variance
+
+        # Ensure values are within float32 range
+        float32_max = np.finfo(np.float32).max
+        float32_min = np.finfo(np.float32).min
+        q01 = max(float32_min / 10, q01)
+        q99 = min(float32_max / 10, q99)
+
+        df[col] = col_data.clip(lower=q01, upper=q99)
+
+    # Final check: ensure no remaining inf/NaN
+    df = df.replace([np.inf, -np.inf], 0)
+    df = df.fillna(0)
+
+    return df
+
+
 def train_volatility_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -309,6 +374,10 @@ def train_volatility_model(
     os.makedirs(output_dir, exist_ok=True)
 
     try:
+        # Clean data before training
+        train_df = clean_dataframe_for_ml(train_df)
+        val_df = clean_dataframe_for_ml(val_df)
+
         config = Config()
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -443,10 +512,13 @@ def generate_regime_predictions_with_model(
         return prepare_regime_predictions(df)
 
     try:
+        # Clean data before creating dataset
+        df = clean_dataframe_for_ml(df)
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Load model
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
         config = Config()
         model = SPHNet(
@@ -745,8 +817,9 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         train_df_with_regime = generate_regime_predictions_with_model(train_df, sphnet_path)
         val_df_with_regime = generate_regime_predictions_with_model(val_df, sphnet_path)
     else:
-        train_df_with_regime = prepare_regime_predictions(train_df)
-        val_df_with_regime = prepare_regime_predictions(val_df)
+        # Clean data even when using threshold-based predictions
+        train_df_with_regime = prepare_regime_predictions(clean_dataframe_for_ml(train_df))
+        val_df_with_regime = prepare_regime_predictions(clean_dataframe_for_ml(val_df))
 
     # Step 3: Train XGBoost on training data with regime predictions
     xgb_model_path = None
@@ -775,7 +848,7 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         if sphnet_path:
             split_df = generate_regime_predictions_with_model(split_df, sphnet_path)
         else:
-            split_df = prepare_regime_predictions(split_df)
+            split_df = prepare_regime_predictions(clean_dataframe_for_ml(split_df))
 
         # Create strategy with period-specific XGBoost model if available
         if xgb_model_path and os.path.exists(xgb_model_path):
@@ -881,6 +954,9 @@ def run_period_backtest(period_name: str, config: Dict) -> Optional[Dict]:
 
     df = pd.read_csv(data_path)
     print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
+
+    # Clean data for ML compatibility
+    df = clean_dataframe_for_ml(df)
 
     # Prepare regime predictions
     df = prepare_regime_predictions(df)
@@ -1283,6 +1359,9 @@ def run_walk_forward_all_periods(train_models: bool = True) -> Dict:
 
         df = pd.read_csv(data_path)
         print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
+
+        # Clean data for ML compatibility
+        df = clean_dataframe_for_ml(df)
 
         # Run walk-forward test with training
         results = walk_forward_test(df, period_name, train_model=train_models)
