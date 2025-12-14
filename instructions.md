@@ -1,689 +1,494 @@
-# XGBoost Trade Quality Classifier - Implementation Guide
+# TrendStrengthML_50 Strategy Robustness Testing Instructions
+
+## Executive Summary
+
+After XGBoost label training, the **TrendStrengthML_50** strategy achieved:
+- **Win Rate: 83.3%** (+33.3pp improvement over baseline)
+- **Trades: 6** 
+- **Return: +4.30%**
+
+**CRITICAL**: This was tested on a **bear market period only**. To validate robustness, we need comprehensive testing across multiple market cycles with non-overlapping training/validation data and random date sampling.
+
+---
 
 ## Objective
 
-Train an XGBoost classifier to predict whether a potential trade will be a WIN or LOSS, then use it as an additional entry filter to improve win rate by +15-25%.
+Validate TrendStrengthML_50 robustness by testing across:
+1. **1 additional bear market period** (2018 Crypto Winter)
+2. **2 bull market periods** (2019-2020 Recovery, 2023-2024 Bull Run)
+3. **Non-overlapping training/validation periods**
+4. **Random starting/ending dates** to ensure strategy isn't overfit to specific timeframes
 
-## Background
+---
 
-Current best strategy: **TrendStrength/SimpleADXTrend** achieves +4.30% return with Sharpe 2.57 in a -22.68% bear market. The goal is to add a machine learning filter that only allows trades when the classifier predicts WIN.
+## Bitcoin Historical Market Cycles
 
-### Current Entry Logic (from simple_adx.py)
-```
-Entry = LOW vol + UPTREND + RSI < 45
-```
+### Data Availability
+- **Binance BTC/USDT trade data**: Available from **August 17, 2017**
+- **Binance BTC/USDT hourly klines**: Available from **December 18, 2017**
+- **Source**: Binance API (free, no API key required) or https://data.binance.vision
 
-### New Entry Logic (after this implementation)
-```
-Entry = LOW vol + UPTREND + RSI < 45 + XGBoost_predicts_WIN
-```
+### Key Market Cycles
+
+#### Bear Markets (Drawdown > 70%)
+| Period | Start Date | End Date | Peak Price | Bottom Price | Drawdown |
+|--------|------------|----------|------------|--------------|----------|
+| 2018 Crypto Winter | Jan 8, 2018 | Dec 15, 2018 | $19,783 | $3,122 | -84% |
+| 2022 Bear Market | Nov 10, 2021 | Nov 21, 2022 | $69,000 | $15,476 | -78% |
+| COVID Crash | Feb 13, 2020 | Mar 13, 2020 | $10,500 | $3,850 | -63% |
+
+#### Bull Markets (Major Rallies)
+| Period | Start Date | End Date | Bottom Price | Peak Price | Gain |
+|--------|------------|----------|--------------|------------|------|
+| 2019 Recovery | Dec 15, 2018 | Jun 26, 2019 | $3,122 | $13,880 | +345% |
+| 2020-2021 Bull | Mar 13, 2020 | Nov 10, 2021 | $3,850 | $69,000 | +1,692% |
+| 2023-2024 Bull | Nov 21, 2022 | Mar 14, 2024 | $15,476 | $73,750 | +376% |
+| 2024+ Bull | Aug 5, 2024 | Present | $49,000 | $103,000+ | +110%+ |
+
+#### Halving Events (Key Cycle Markers)
+- July 9, 2016: Block reward 25 → 12.5 BTC
+- May 11, 2020: Block reward 12.5 → 6.25 BTC
+- April 19, 2024: Block reward 6.25 → 3.125 BTC
+
+---
+
+## Recommended Test Periods
+
+### Period 1: 2018 Bear Market (REQUIRED)
+- **Type**: Bear Market
+- **Date Range**: January 1, 2018 → December 31, 2018
+- **Training/Val Split**: Jan-Aug 2018 (train), Sep-Dec 2018 (test)
+- **Characteristics**: -84% drawdown, post-ICO crash, high volatility
+
+### Period 2: 2019-2020 Recovery (REQUIRED - Bull Market #1)
+- **Type**: Bull Market / Recovery
+- **Date Range**: January 1, 2019 → December 31, 2020
+- **Training/Val Split**: Jan 2019 - Aug 2020 (train), Sep-Dec 2020 (test)
+- **Characteristics**: Recovery from bottom, includes COVID crash and bounce
+
+### Period 3: 2023-2024 Bull Market (REQUIRED - Bull Market #2)
+- **Type**: Bull Market
+- **Date Range**: January 1, 2023 → October 31, 2024
+- **Training/Val Split**: Jan 2023 - Apr 2024 (train), May-Oct 2024 (test)
+- **Characteristics**: ETF approval rally, new ATH, halving event
+
+### Period 4: Current Period (CONTROL - Already Tested)
+- **Date Range**: November 2024 onwards (90-day test)
+- **Status**: Already tested - baseline results
 
 ---
 
 ## Implementation Plan
 
-### Step 1: Generate Trade Labels from Backtests
+### Phase 1: Data Infrastructure
 
-**File to create:** `btc_volatility_predictor/ml/generate_trade_labels.py`
-
-```python
-"""
-Generate WIN/LOSS labels from historical backtest trades.
-
-Labels are derived automatically from backtest results:
-- WIN: Trade P&L > 0
-- LOSS: Trade P&L <= 0
-
-Output: CSV with features at trade entry + WIN/LOSS label
-"""
-```
-
-**Key Logic:**
-1. Load predictions CSV (`backtest/results_v2/test_predictions_90d.csv`)
-2. Run the winning strategy (TrendStrength or SimpleADXTrend) on FULL 365-day data
-3. For each trade entry point, extract:
-   - All features at that moment (from features_365d.csv)
-   - The trade outcome (WIN=1, LOSS=0)
-4. Save as labeled dataset
-
-**Feature Set for Each Trade Entry:**
-```python
-TRADE_FEATURES = [
-    # Existing features (from features_365d.csv)
-    'rsi_14', 'rsi_6',
-    'bb_bandwidth_20', 'bb_position',
-    'atr_14', 'atr_24',
-    'vol_gk_1h', 'vol_gk_6h', 'vol_gk_24h',
-    'vol_park_1h', 'vol_park_24h',
-    'vol_realized_24h', 'vol_of_vol',
-    'momentum_1h', 'momentum_6h', 'momentum_12h', 'momentum_24h',
-    'macd_hist',
-    'volume_ma_ratio', 'volume_change',
-    'adx_14', 'plus_di_14', 'minus_di_14',
-    'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
-    
-    # NEW features to compute at trade entry
-    'trend_strength',           # SMA_fast / SMA_slow ratio
-    'price_vs_sma_fast',        # close / SMA_72
-    'price_vs_sma_slow',        # close / SMA_168
-    'rsi_slope_3h',             # RSI change over last 3 hours
-    'vol_regime_prob',          # Model's confidence in LOW vol
-    'bars_since_last_trade',    # Time since last closed trade
-    'recent_trade_pnl',         # P&L of last closed trade
-    'consecutive_wins',         # Count of consecutive wins
-    'consecutive_losses',       # Count of consecutive losses
-]
-```
-
----
-
-### Step 2: Create Training Pipeline
-
-**File to create:** `btc_volatility_predictor/ml/train_xgboost.py`
+#### Task 1.1: Extended Data Fetcher
+Create `fetch_historical_periods.py`:
 
 ```python
 """
-Train XGBoost classifier to predict WIN/LOSS trades.
+Fetch historical BTC/USDT data for multiple market cycles.
 
-Training approach:
-- Train on ~275 days of data (365 - 90 test days)
-- Validate on held-out portion
-- Test on last 90 days (same period as backtest)
-
-Target: Binary classification (WIN=1, LOSS=0)
+Periods to fetch:
+1. 2018 Bear: Jan 2018 - Dec 2018 (366 days)
+2. 2019-2020 Recovery: Jan 2019 - Dec 2020 (731 days)
+3. 2023-2024 Bull: Jan 2023 - Nov 2024 (700 days)
 """
 
-import xgboost as xgb
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, 
-    f1_score, roc_auc_score, classification_report
-)
-import optuna  # For hyperparameter tuning
-```
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import os
 
-**XGBoost Configuration:**
-```python
-DEFAULT_PARAMS = {
-    'objective': 'binary:logistic',
-    'eval_metric': ['auc', 'logloss'],
-    'max_depth': 4,              # Shallow to prevent overfitting
-    'learning_rate': 0.05,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'min_child_weight': 5,
-    'reg_alpha': 0.1,            # L1 regularization
-    'reg_lambda': 1.0,           # L2 regularization
-    'scale_pos_weight': 1.0,     # Adjust if class imbalance
-    'random_state': 42,
+PERIODS = {
+    '2018_bear': {
+        'start': '2018-01-01',
+        'end': '2018-12-31',
+        'type': 'bear'
+    },
+    '2019_2020_recovery': {
+        'start': '2019-01-01',
+        'end': '2020-12-31',
+        'type': 'bull'
+    },
+    '2023_2024_bull': {
+        'start': '2023-01-01',
+        'end': '2024-10-31',
+        'type': 'bull'
+    }
 }
+
+def fetch_binance_klines(start_date: str, end_date: str, 
+                         symbol: str = "BTCUSDT", interval: str = "1h"):
+    """Fetch klines from Binance API with pagination."""
+    base_url = "https://api.binance.com/api/v3/klines"
+    
+    start_ts = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
+    end_ts = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp() * 1000)
+    
+    all_klines = []
+    current_start = start_ts
+    
+    while current_start < end_ts:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": current_start,
+            "endTime": end_ts,
+            "limit": 1000
+        }
+        
+        response = requests.get(base_url, params=params)
+        
+        if response.status_code != 200:
+            raise Exception(f"API Error: {response.status_code}")
+            
+        data = response.json()
+        if not data:
+            break
+            
+        all_klines.extend(data)
+        current_start = data[-1][0] + 1
+        time.sleep(0.1)  # Rate limiting
+        
+    # Convert to DataFrame
+    columns = ['open_time', 'open', 'high', 'low', 'close', 'volume',
+               'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+               'taker_buy_quote', 'ignore']
+    
+    df = pd.DataFrame(all_klines, columns=columns)
+    df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
+    
+    for col in ['open', 'high', 'low', 'close', 'volume', 'quote_volume']:
+        df[col] = df[col].astype(float)
+        
+    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+               'trades', 'quote_volume']]
+
+def fetch_all_periods():
+    """Fetch all required historical periods."""
+    os.makedirs("data/raw/historical", exist_ok=True)
+    
+    for period_name, config in PERIODS.items():
+        print(f"Fetching {period_name}...")
+        df = fetch_binance_klines(config['start'], config['end'])
+        
+        output_path = f"data/raw/historical/btcusdt_1h_{period_name}.csv"
+        df.to_csv(output_path, index=False)
+        
+        print(f"  Saved {len(df)} candles to {output_path}")
+        print(f"  Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+
+if __name__ == "__main__":
+    fetch_all_periods()
 ```
 
-**Training Process:**
-1. Load labeled trade data from Step 1
-2. Time-based train/val/test split (no shuffling - preserve temporal order)
-3. Train with early stopping on validation AUC
-4. Evaluate on test set
-5. Save model to `checkpoints/trade_classifier.json`
-
----
-
-### Step 3: Create Prediction Filter
-
-**File to create:** `btc_volatility_predictor/ml/trade_filter.py`
+#### Task 1.2: Feature Engineering for Historical Data
+Extend `data/features.py` to process all historical periods:
 
 ```python
-"""
-Trade quality filter using trained XGBoost model.
-
-Usage in strategy:
-    filter = TradeQualityFilter('checkpoints/trade_classifier.json')
+def prepare_all_historical_datasets():
+    """Prepare feature datasets for all historical periods."""
+    from data.features import prepare_dataset
     
-    if filter.should_trade(features_dict, threshold=0.6):
-        # Execute trade
-"""
-
-class TradeQualityFilter:
-    def __init__(self, model_path: str, threshold: float = 0.5):
-        self.model = xgb.Booster()
-        self.model.load_model(model_path)
-        self.threshold = threshold
-        self.feature_names = [...]  # Same order as training
+    periods = ['2018_bear', '2019_2020_recovery', '2023_2024_bull']
     
-    def predict_win_probability(self, features: dict) -> float:
-        """Return probability that trade will be a WIN."""
-        pass
-    
-    def should_trade(self, features: dict, threshold: float = None) -> bool:
-        """Return True if classifier predicts WIN with confidence >= threshold."""
-        pass
+    for period in periods:
+        input_path = f"data/raw/historical/btcusdt_1h_{period}.csv"
+        output_path = f"data/processed/historical/features_{period}.csv"
+        
+        if os.path.exists(input_path):
+            prepare_dataset(input_path, output_path)
 ```
 
 ---
 
-### Step 4: Integrate into Strategy
+### Phase 2: Multi-Period Backtesting Framework
 
-**File to modify:** `btc_volatility_predictor/backtest/strategies/simple_adx.py`
-
-Add new strategy class:
-
-```python
-class TrendStrengthWithML(BaseStrategy):
-    """
-    TrendStrength strategy + XGBoost WIN/LOSS filter.
-    
-    Entry conditions (ALL must be true):
-    1. Vol = LOW (from SPHNet model)
-    2. Trend = UP (72h/168h SMA)
-    3. RSI < 45
-    4. XGBoost predicts WIN with probability >= threshold
-    """
-    
-    def __init__(
-        self,
-        ml_model_path: str = "checkpoints/trade_classifier.json",
-        ml_threshold: float = 0.6,  # Only trade if P(WIN) >= 60%
-        **kwargs
-    ):
-        super().__init__(name="TrendStrengthML")
-        self.ml_filter = TradeQualityFilter(ml_model_path, ml_threshold)
-        # ... rest of init
-```
-
----
-
-### Step 5: Create Backtest Runner
-
-**File to create:** `btc_volatility_predictor/backtest/run_backtest_v5.py`
-
-```python
-"""
-V5 Backtest Runner - ML-Enhanced Strategies
-
-Tests the hypothesis: XGBoost filter improves win rate by 15-25%
-"""
-
-# Compare:
-# 1. TrendStrength (baseline)
-# 2. TrendStrengthML with threshold=0.5
-# 3. TrendStrengthML with threshold=0.6
-# 4. TrendStrengthML with threshold=0.7
-```
-
----
-
-## File Structure After Implementation
-
-```
-btc_volatility_predictor/
-├── ml/                              # NEW DIRECTORY
-│   ├── __init__.py
-│   ├── generate_trade_labels.py     # Step 1
-│   ├── train_xgboost.py             # Step 2
-│   ├── trade_filter.py              # Step 3
-│   └── feature_engineering.py       # Helper for new features
-├── backtest/
-│   ├── strategies/
-│   │   ├── simple_adx.py            # MODIFY: Add TrendStrengthWithML
-│   │   └── ...
-│   ├── run_backtest_v5.py           # NEW: V5 runner
-│   └── ...
-├── checkpoints/
-│   ├── trade_classifier.json        # Trained XGBoost model
-│   └── ...
-└── data/
-    └── ml/
-        └── trade_labels.csv         # Generated labels
-```
-
----
-
-## Expected Results
-
-| Metric | TrendStrength (Baseline) | TrendStrengthML (Expected) |
-|--------|-------------------------|---------------------------|
-| Win Rate | ~58% (7/12 trades) | 73-83% (+15-25%) |
-| Trades | 12 | ~8-10 (fewer, higher quality) |
-| Return | +4.30% | +4-6% (similar or better) |
-| Sharpe | 2.57 | 2.5-3.5 |
-
----
-
-## Implementation Commands
-
-Run these in order:
-
-```bash
-cd btc_volatility_predictor
-
-# Step 1: Generate trade labels
-python ml/generate_trade_labels.py
-
-# Step 2: Train XGBoost classifier
-python ml/train_xgboost.py
-
-# Step 3: Run V5 backtest with ML filter
-python backtest/run_backtest_v5.py
-```
-
----
-
-## Key Considerations
-
-### 1. Avoid Look-Ahead Bias
-- Only use features available AT THE TIME of trade entry
-- Train on historical data BEFORE test period
-- Use walk-forward validation if possible
-
-### 2. Handle Class Imbalance
-- If WIN/LOSS ratio is skewed, use `scale_pos_weight` in XGBoost
-- Consider oversampling minority class (SMOTE)
-- Use stratified sampling in cross-validation
-
-### 3. Feature Importance Analysis
-After training, analyze which features matter most:
-```python
-xgb.plot_importance(model, max_num_features=15)
-```
-
-### 4. Threshold Tuning
-- Higher threshold = fewer trades, higher win rate
-- Lower threshold = more trades, lower win rate
-- Find optimal balance via backtesting
-
-### 5. Overfitting Prevention
-- Use early stopping
-- Keep model shallow (max_depth=3-5)
-- Strong regularization (alpha, lambda)
-- Cross-validate on time-series splits
-
----
-
-## Detailed Implementation: generate_trade_labels.py
+#### Task 2.1: Create `backtest/run_backtest_multiperiod.py`
 
 ```python
 #!/usr/bin/env python3
 """
-Generate WIN/LOSS labels from historical trades.
+Multi-Period Robustness Testing for TrendStrengthML_50
 
-This script:
-1. Loads full 365-day feature data
-2. Simulates TrendStrength strategy on entire dataset
-3. Records features at each trade entry
-4. Labels each trade as WIN (P&L > 0) or LOSS (P&L <= 0)
-5. Saves labeled dataset for XGBoost training
+Tests the strategy across multiple market cycles:
+1. 2018 Bear Market
+2. 2019-2020 Recovery/Bull
+3. 2023-2024 Bull Market
+4. Random date sampling within each period
+
+Success Criteria:
+- Consistent positive returns across ALL market types
+- Win rate > 60% in each period
+- Sharpe ratio > 0.5 in each period
+- Max drawdown < 20% in each period
 """
 
 import os
 import sys
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple
+from datetime import datetime, timedelta
+import random
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backtest.engine import BacktestEngine
-from backtest.strategies.simple_adx import TrendStrengthStrategy
+from backtest.strategies import TrendStrengthWithML, TrendStrengthStrategy
 
+# Configuration
+INITIAL_CAPITAL = 10000
+TRANSACTION_COST = 0.001
+SLIPPAGE = 0.0005
 
-# Features to extract at trade entry
-CORE_FEATURES = [
-    'rsi_14', 'rsi_6', 'bb_bandwidth_20', 'bb_position',
-    'atr_14', 'atr_24', 'vol_gk_1h', 'vol_gk_6h', 'vol_gk_24h',
-    'vol_park_1h', 'vol_park_24h', 'vol_realized_24h', 'vol_of_vol',
-    'momentum_1h', 'momentum_6h', 'momentum_12h', 'momentum_24h',
-    'macd_hist', 'volume_ma_ratio', 'volume_change',
-    'adx_14', 'plus_di_14', 'minus_di_14',
-    'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
-]
+PERIODS = {
+    '2018_bear': {
+        'path': 'data/processed/historical/features_2018_bear.csv',
+        'type': 'bear',
+        'description': '2018 Crypto Winter (-84% drawdown)'
+    },
+    '2019_2020_recovery': {
+        'path': 'data/processed/historical/features_2019_2020_recovery.csv',
+        'type': 'bull',
+        'description': '2019-2020 Recovery (+345% then +1692%)'
+    },
+    '2023_2024_bull': {
+        'path': 'data/processed/historical/features_2023_2024_bull.csv',
+        'type': 'bull',
+        'description': '2023-2024 Bull Market (ETF Rally, +376%)'
+    }
+}
 
-
-def compute_additional_features(row: dict, history: List[dict]) -> dict:
-    """Compute additional features for trade entry."""
-    features = {}
-    
-    close = row.get('close', 0)
-    
-    # Trend strength features
-    if len(history) >= 168:
-        sma_72 = np.mean([h['close'] for h in history[-72:]])
-        sma_168 = np.mean([h['close'] for h in history[-168:]])
-        
-        features['trend_strength'] = sma_72 / sma_168 if sma_168 > 0 else 1.0
-        features['price_vs_sma_fast'] = close / sma_72 if sma_72 > 0 else 1.0
-        features['price_vs_sma_slow'] = close / sma_168 if sma_168 > 0 else 1.0
-    else:
-        features['trend_strength'] = 1.0
-        features['price_vs_sma_fast'] = 1.0
-        features['price_vs_sma_slow'] = 1.0
-    
-    # RSI slope (change over last 3 hours)
-    if len(history) >= 3:
-        rsi_now = row.get('rsi_14', 50)
-        rsi_3h_ago = history[-3].get('rsi_14', 50)
-        features['rsi_slope_3h'] = rsi_now - rsi_3h_ago
-    else:
-        features['rsi_slope_3h'] = 0.0
-    
-    # Volatility regime probability (from predictions if available)
-    features['vol_regime_prob'] = row.get('prediction_prob', 0.5)
-    
-    return features
-
-
-def generate_labels(
-    data_path: str = "data/processed/features_365d.csv",
-    predictions_path: str = None,  # Optional: include model predictions
-    output_path: str = "data/ml/trade_labels.csv",
-    strategy_class = TrendStrengthStrategy,
-) -> pd.DataFrame:
+def generate_random_windows(df: pd.DataFrame, n_windows: int = 10, 
+                            min_days: int = 60, max_days: int = 120) -> list:
     """
-    Generate trade labels by running strategy on historical data.
+    Generate random non-overlapping date windows for testing.
     
-    Returns DataFrame with:
-    - Features at trade entry
-    - Label: 1 = WIN, 0 = LOSS
-    - Trade metadata (entry_price, exit_price, pnl, etc.)
+    Args:
+        df: DataFrame with data
+        n_windows: Number of random windows to generate
+        min_days: Minimum window size in days
+        max_days: Maximum window size in days
+        
+    Returns:
+        List of (start_idx, end_idx) tuples
     """
+    n_samples = len(df)
+    min_samples = min_days * 24
+    max_samples = max_days * 24
     
-    print(f"Loading data from {data_path}...")
-    df = pd.read_csv(data_path)
+    windows = []
+    used_indices = set()
     
-    # If predictions available, merge them
-    if predictions_path and os.path.exists(predictions_path):
-        pred_df = pd.read_csv(predictions_path)
-        # Align by index or timestamp
-        if 'predicted_regime' in pred_df.columns:
-            # Use predictions for the overlapping period
-            pass
-    
-    # For full 365 days, we need to generate predictions
-    # For now, use a simple volatility threshold
-    vol_threshold = df['target_volatility'].median()
-    df['predicted_regime'] = (df['target_volatility'] > vol_threshold).astype(int)
-    
-    print(f"Running strategy on {len(df)} samples...")
-    
-    # Run backtest
-    engine = BacktestEngine(
-        initial_capital=10000,
-        transaction_cost=0.001,
-        slippage=0.0005
-    )
-    
-    strategy = strategy_class()
-    result = engine.run(strategy, df)
-    
-    print(f"Generated {result.num_trades} trades")
-    print(f"Win rate: {result.win_rate:.1%}")
-    
-    # Extract features for each trade
-    labeled_data = []
-    data_records = df.to_dict('records')
-    
-    for trade in result.trades:
-        entry_idx = trade.entry_time
+    attempts = 0
+    while len(windows) < n_windows and attempts < n_windows * 10:
+        # Random window size
+        window_size = random.randint(min_samples, max_samples)
         
-        if entry_idx < 0 or entry_idx >= len(data_records):
-            continue
+        # Random start point (leave room for window)
+        max_start = n_samples - window_size - 168  # Leave warmup
+        if max_start < 168:
+            break
+            
+        start_idx = random.randint(168, max_start)
+        end_idx = start_idx + window_size
         
-        row = data_records[entry_idx]
-        history = data_records[max(0, entry_idx-168):entry_idx]
-        
-        # Extract core features
-        features = {}
-        for feat in CORE_FEATURES:
-            features[feat] = row.get(feat, 0)
-        
-        # Add computed features
-        features.update(compute_additional_features(row, history))
-        
-        # Add label
-        features['label'] = 1 if trade.pnl > 0 else 0
-        
-        # Add metadata (for analysis, not training)
-        features['_entry_time'] = entry_idx
-        features['_exit_time'] = trade.exit_time
-        features['_entry_price'] = trade.entry_price
-        features['_exit_price'] = trade.exit_price
-        features['_pnl'] = trade.pnl
-        features['_pnl_pct'] = trade.pnl_pct
-        features['_holding_period'] = trade.holding_period
-        
-        labeled_data.append(features)
+        # Check for overlap
+        window_set = set(range(start_idx, end_idx))
+        if not window_set.intersection(used_indices):
+            windows.append((start_idx, end_idx))
+            used_indices.update(window_set)
+            
+        attempts += 1
     
-    # Create DataFrame
-    labels_df = pd.DataFrame(labeled_data)
-    
-    # Save
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    labels_df.to_csv(output_path, index=False)
-    
-    # Summary
-    print(f"\n{'='*50}")
-    print("LABEL GENERATION SUMMARY")
-    print(f"{'='*50}")
-    print(f"Total trades: {len(labels_df)}")
-    print(f"Wins: {labels_df['label'].sum()} ({labels_df['label'].mean():.1%})")
-    print(f"Losses: {len(labels_df) - labels_df['label'].sum()}")
-    print(f"Features: {len(CORE_FEATURES) + 5}")  # +5 for computed features
-    print(f"Saved to: {output_path}")
-    
-    return labels_df
+    return windows
 
-
-if __name__ == "__main__":
-    generate_labels()
-```
-
----
-
-## Detailed Implementation: train_xgboost.py
-
-```python
-#!/usr/bin/env python3
-"""
-Train XGBoost classifier for trade quality prediction.
-
-Predicts: Will this trade be a WIN (1) or LOSS (0)?
-"""
-
-import os
-import sys
-import json
-import numpy as np
-import pandas as pd
-import xgboost as xgb
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, classification_report,
-    confusion_matrix
-)
-import matplotlib.pyplot as plt
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-# Features to use (exclude metadata columns starting with _)
-FEATURE_COLS = [
-    'rsi_14', 'rsi_6', 'bb_bandwidth_20', 'bb_position',
-    'atr_14', 'atr_24', 'vol_gk_1h', 'vol_gk_6h', 'vol_gk_24h',
-    'vol_park_1h', 'vol_park_24h', 'vol_realized_24h', 'vol_of_vol',
-    'momentum_1h', 'momentum_6h', 'momentum_12h', 'momentum_24h',
-    'macd_hist', 'volume_ma_ratio', 'volume_change',
-    'adx_14', 'plus_di_14', 'minus_di_14',
-    'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
-    'trend_strength', 'price_vs_sma_fast', 'price_vs_sma_slow',
-    'rsi_slope_3h', 'vol_regime_prob',
-]
-
-
-def load_and_split_data(
-    data_path: str = "data/ml/trade_labels.csv",
-    test_ratio: float = 0.2,
-    val_ratio: float = 0.15,
-) -> tuple:
+def run_period_backtest(period_name: str, config: dict) -> dict:
     """
-    Load labeled data and split by time (no shuffling).
+    Run comprehensive backtest for a single period.
     
     Returns:
-        X_train, X_val, X_test, y_train, y_val, y_test
+        Dict with results for full period and random windows
     """
-    df = pd.read_csv(data_path)
+    print(f"\n{'='*60}")
+    print(f"TESTING: {period_name.upper()}")
+    print(f"Description: {config['description']}")
+    print(f"{'='*60}")
     
-    # Sort by entry time to ensure temporal order
-    df = df.sort_values('_entry_time').reset_index(drop=True)
+    if not os.path.exists(config['path']):
+        print(f"ERROR: Data not found at {config['path']}")
+        return None
     
-    # Get features and labels
-    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
-    X = df[feature_cols].values
-    y = df['label'].values
+    df = pd.read_csv(config['path'])
+    print(f"Loaded {len(df)} samples ({len(df)/24:.0f} days)")
     
-    # Time-based split
-    n = len(df)
-    n_test = int(n * test_ratio)
-    n_val = int(n * val_ratio)
-    n_train = n - n_test - n_val
+    # Generate volatility predictions if not present
+    if 'predicted_regime' not in df.columns:
+        # Use median volatility as threshold
+        vol_col = 'target_volatility' if 'target_volatility' in df.columns else 'vol_realized_24h'
+        if vol_col in df.columns:
+            threshold = df[vol_col].median()
+            df['predicted_regime'] = (df[vol_col] > threshold).astype(int)
+        else:
+            df['predicted_regime'] = 0
     
-    X_train = X[:n_train]
-    y_train = y[:n_train]
-    X_val = X[n_train:n_train + n_val]
-    y_val = y[n_train:n_train + n_val]
-    X_test = X[n_train + n_val:]
-    y_test = y[n_train + n_val:]
-    
-    print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-    print(f"Train WIN rate: {y_train.mean():.1%}")
-    print(f"Test WIN rate: {y_test.mean():.1%}")
-    
-    return X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
-
-
-def train_xgboost(
-    X_train, X_val, y_train, y_val,
-    feature_names: list,
-    params: dict = None,
-) -> xgb.Booster:
-    """
-    Train XGBoost classifier with early stopping.
-    """
-    if params is None:
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': ['auc', 'logloss'],
-            'max_depth': 4,
-            'learning_rate': 0.05,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'min_child_weight': 5,
-            'reg_alpha': 0.1,
-            'reg_lambda': 1.0,
-            'random_state': 42,
-        }
-    
-    # Handle class imbalance
-    pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    params['scale_pos_weight'] = pos_weight
-    print(f"Class weight: {pos_weight:.2f}")
-    
-    # Create DMatrix
-    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
-    dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_names)
-    
-    # Train with early stopping
-    evals = [(dtrain, 'train'), (dval, 'val')]
-    
-    model = xgb.train(
-        params,
-        dtrain,
-        num_boost_round=500,
-        evals=evals,
-        early_stopping_rounds=30,
-        verbose_eval=20,
+    engine = BacktestEngine(
+        initial_capital=INITIAL_CAPITAL,
+        transaction_cost=TRANSACTION_COST,
+        slippage=SLIPPAGE
     )
     
-    return model
-
-
-def evaluate_model(
-    model: xgb.Booster,
-    X_test, y_test,
-    feature_names: list,
-    threshold: float = 0.5,
-) -> dict:
-    """Evaluate model on test set."""
-    
-    dtest = xgb.DMatrix(X_test, feature_names=feature_names)
-    y_prob = model.predict(dtest)
-    y_pred = (y_prob >= threshold).astype(int)
-    
-    metrics = {
-        'accuracy': accuracy_score(y_test, y_pred),
-        'precision': precision_score(y_test, y_pred, zero_division=0),
-        'recall': recall_score(y_test, y_pred, zero_division=0),
-        'f1': f1_score(y_test, y_pred, zero_division=0),
-        'auc': roc_auc_score(y_test, y_prob),
+    results = {
+        'period': period_name,
+        'type': config['type'],
+        'full_period': None,
+        'random_windows': []
     }
     
-    print(f"\n{'='*50}")
-    print(f"TEST RESULTS (threshold={threshold})")
-    print(f"{'='*50}")
-    print(f"Accuracy:  {metrics['accuracy']:.1%}")
-    print(f"Precision: {metrics['precision']:.1%}")
-    print(f"Recall:    {metrics['recall']:.1%}")
-    print(f"F1 Score:  {metrics['f1']:.3f}")
-    print(f"AUC:       {metrics['auc']:.3f}")
+    # === Test 1: Full Period ===
+    print("\n--- Full Period Test ---")
     
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    strategies = [
+        TrendStrengthStrategy(),  # Baseline
+        TrendStrengthWithML(ml_threshold=0.5),  # Our target strategy
+    ]
     
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=['LOSS', 'WIN']))
+    full_results = []
+    for strategy in strategies:
+        result = engine.run(strategy, df)
+        full_results.append({
+            'strategy': strategy.name,
+            'return': result.total_return,
+            'sharpe': result.sharpe_ratio,
+            'max_dd': result.max_drawdown,
+            'trades': result.num_trades,
+            'win_rate': result.win_rate if result.num_trades > 0 else 0
+        })
+        
+        print(f"  {strategy.name}: Return={result.total_return*100:+.2f}%, "
+              f"Sharpe={result.sharpe_ratio:.2f}, Trades={result.num_trades}, "
+              f"WinRate={result.win_rate*100:.1f}%")
     
-    return metrics
+    results['full_period'] = full_results
+    
+    # === Test 2: Random Windows ===
+    print("\n--- Random Window Tests (10 windows) ---")
+    
+    windows = generate_random_windows(df, n_windows=10, min_days=60, max_days=90)
+    
+    for i, (start_idx, end_idx) in enumerate(windows):
+        window_df = df.iloc[start_idx:end_idx].reset_index(drop=True)
+        
+        # Run TrendStrengthML_50 on this window
+        strategy = TrendStrengthWithML(ml_threshold=0.5)
+        result = engine.run(strategy, window_df)
+        
+        window_result = {
+            'window': i + 1,
+            'start_idx': start_idx,
+            'end_idx': end_idx,
+            'days': (end_idx - start_idx) / 24,
+            'return': result.total_return,
+            'sharpe': result.sharpe_ratio,
+            'max_dd': result.max_drawdown,
+            'trades': result.num_trades,
+            'win_rate': result.win_rate if result.num_trades > 0 else 0
+        }
+        results['random_windows'].append(window_result)
+        
+        print(f"  Window {i+1}: {(end_idx-start_idx)/24:.0f}d, "
+              f"Return={result.total_return*100:+.2f}%, "
+              f"Trades={result.num_trades}, WinRate={result.win_rate*100:.1f}%")
+    
+    return results
 
-
-def plot_feature_importance(model: xgb.Booster, output_path: str = "figures/xgb_importance.png"):
-    """Plot and save feature importance."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+def run_cross_validation(n_folds: int = 5):
+    """
+    Run k-fold cross-validation across all data.
     
-    fig, ax = plt.subplots(figsize=(10, 8))
-    xgb.plot_importance(model, ax=ax, max_num_features=20, importance_type='gain')
-    plt.title("XGBoost Feature Importance (Gain)")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved feature importance to {output_path}")
-
+    Combines all historical data and splits into folds.
+    Each fold tests on different time periods.
+    """
+    print("\n" + "="*60)
+    print("CROSS-VALIDATION TEST")
+    print("="*60)
+    
+    # TODO: Implement time-series cross-validation
+    # - Split each period into train/test
+    # - Train XGBoost on train portion
+    # - Test on test portion
+    # - Aggregate results
+    
+    pass
 
 def main():
-    # Load data
-    print("Loading labeled trade data...")
-    X_train, X_val, X_test, y_train, y_val, y_test, feature_names = load_and_split_data()
+    """Run multi-period robustness testing."""
+    print("="*60)
+    print("TRENDSTRENGTHML_50 ROBUSTNESS TESTING")
+    print("Multi-Period Analysis")
+    print("="*60)
     
-    # Train
-    print("\nTraining XGBoost...")
-    model = train_xgboost(X_train, X_val, y_train, y_val, feature_names)
+    all_results = {}
     
-    # Evaluate at different thresholds
-    for threshold in [0.5, 0.6, 0.7]:
-        evaluate_model(model, X_test, y_test, feature_names, threshold)
+    # Run tests for each period
+    for period_name, config in PERIODS.items():
+        results = run_period_backtest(period_name, config)
+        if results:
+            all_results[period_name] = results
     
-    # Save model
-    os.makedirs("checkpoints", exist_ok=True)
-    model.save_model("checkpoints/trade_classifier.json")
-    print("\nModel saved to checkpoints/trade_classifier.json")
+    # Summary statistics
+    print("\n" + "="*60)
+    print("SUMMARY ACROSS ALL PERIODS")
+    print("="*60)
     
-    # Save feature names for inference
-    with open("checkpoints/trade_classifier_features.json", 'w') as f:
-        json.dump(feature_names, f)
+    summary_data = []
+    for period_name, results in all_results.items():
+        if results and results['full_period']:
+            ml_result = next((r for r in results['full_period'] 
+                            if 'ML' in r['strategy']), None)
+            if ml_result:
+                summary_data.append({
+                    'Period': period_name,
+                    'Type': results['type'],
+                    'Return': ml_result['return'],
+                    'Sharpe': ml_result['sharpe'],
+                    'MaxDD': ml_result['max_dd'],
+                    'Trades': ml_result['trades'],
+                    'WinRate': ml_result['win_rate']
+                })
     
-    # Plot importance
-    plot_feature_importance(model)
+    if summary_data:
+        summary_df = pd.DataFrame(summary_data)
+        print(summary_df.to_string(index=False))
+        
+        # Aggregate stats
+        print(f"\n--- Aggregate Statistics ---")
+        print(f"Average Return: {summary_df['Return'].mean()*100:+.2f}%")
+        print(f"Average Sharpe: {summary_df['Sharpe'].mean():.2f}")
+        print(f"Average Win Rate: {summary_df['WinRate'].mean()*100:.1f}%")
+        print(f"Worst Drawdown: {summary_df['MaxDD'].max()*100:.1f}%")
+        
+        # Success criteria check
+        print("\n--- Success Criteria Check ---")
+        all_positive = all(r['Return'] > 0 for r in summary_data)
+        all_high_wr = all(r['WinRate'] > 0.6 for r in summary_data)
+        all_good_sharpe = all(r['Sharpe'] > 0.5 for r in summary_data)
+        all_low_dd = all(r['MaxDD'] < 0.20 for r in summary_data)
+        
+        print(f"  All periods positive: {'PASS' if all_positive else 'FAIL'}")
+        print(f"  All periods WR > 60%: {'PASS' if all_high_wr else 'FAIL'}")
+        print(f"  All periods Sharpe > 0.5: {'PASS' if all_good_sharpe else 'FAIL'}")
+        print(f"  All periods MaxDD < 20%: {'PASS' if all_low_dd else 'FAIL'}")
     
-    print("\nTraining complete!")
-
+    # Save results
+    os.makedirs("backtest/results_multiperiod", exist_ok=True)
+    with open("backtest/results_multiperiod/robustness_results.json", 'w') as f:
+        json.dump(all_results, f, indent=2, default=str)
+    
+    print(f"\nResults saved to backtest/results_multiperiod/robustness_results.json")
 
 if __name__ == "__main__":
     main()
@@ -691,226 +496,218 @@ if __name__ == "__main__":
 
 ---
 
-## Detailed Implementation: trade_filter.py
+### Phase 3: Walk-Forward Optimization
+
+#### Task 3.1: Implement Rolling Window Training
+
+For each test period, implement:
+1. **Train XGBoost on first 70% of period**
+2. **Validate on middle 15%**
+3. **Test on final 15%**
+
+This ensures truly non-overlapping training/test data.
 
 ```python
-#!/usr/bin/env python3
-"""
-Trade quality filter using trained XGBoost model.
-
-Provides a simple interface for strategies to check
-if a potential trade is predicted to be a WIN.
-"""
-
-import os
-import json
-import numpy as np
-import xgboost as xgb
-from typing import Dict, List, Optional
-
-
-class TradeQualityFilter:
+def walk_forward_test(df: pd.DataFrame, period_name: str):
     """
-    Filter trades based on XGBoost WIN/LOSS prediction.
+    Walk-forward analysis with rolling XGBoost training.
     
-    Usage:
-        filter = TradeQualityFilter()
-        
-        # In strategy:
-        if filter.should_trade(features, threshold=0.6):
-            return 'BUY'
+    Split:
+    - Train: First 70% of data
+    - Validate: Next 15% of data
+    - Test: Final 15% of data
     """
+    n = len(df)
+    n_train = int(n * 0.70)
+    n_val = int(n * 0.15)
+    n_test = n - n_train - n_val
     
-    def __init__(
-        self,
-        model_path: str = "checkpoints/trade_classifier.json",
-        features_path: str = "checkpoints/trade_classifier_features.json",
-        default_threshold: float = 0.5,
-    ):
-        """
-        Initialize filter with trained model.
-        
-        Args:
-            model_path: Path to XGBoost model file
-            features_path: Path to feature names JSON
-            default_threshold: Default probability threshold for WIN prediction
-        """
-        self.default_threshold = default_threshold
-        self.model = None
-        self.feature_names = None
-        
-        # Load model
-        if os.path.exists(model_path):
-            self.model = xgb.Booster()
-            self.model.load_model(model_path)
-            print(f"Loaded trade classifier from {model_path}")
-        else:
-            print(f"WARNING: Trade classifier not found at {model_path}")
-        
-        # Load feature names
-        if os.path.exists(features_path):
-            with open(features_path, 'r') as f:
-                self.feature_names = json.load(f)
-        else:
-            print(f"WARNING: Feature names not found at {features_path}")
+    train_df = df.iloc[:n_train]
+    val_df = df.iloc[n_train:n_train + n_val]
+    test_df = df.iloc[n_train + n_val:]
     
-    def is_ready(self) -> bool:
-        """Check if filter is properly initialized."""
-        return self.model is not None and self.feature_names is not None
+    print(f"Walk-Forward Split for {period_name}:")
+    print(f"  Train: {n_train} samples ({n_train/24:.0f} days)")
+    print(f"  Val: {n_val} samples ({n_val/24:.0f} days)")
+    print(f"  Test: {n_test} samples ({n_test/24:.0f} days)")
     
-    def extract_features(self, row: dict, history: List[dict]) -> np.ndarray:
-        """
-        Extract features from current row and history.
-        
-        Args:
-            row: Current bar data (dict with feature values)
-            history: List of previous bars
-            
-        Returns:
-            Feature array in correct order
-        """
-        features = {}
-        
-        # Core features from row
-        for feat in self.feature_names:
-            if feat in row:
-                features[feat] = row[feat]
-            elif feat == 'trend_strength':
-                # Compute trend strength
-                if len(history) >= 168:
-                    sma_72 = np.mean([h.get('close', 0) for h in history[-72:]])
-                    sma_168 = np.mean([h.get('close', 0) for h in history[-168:]])
-                    features[feat] = sma_72 / sma_168 if sma_168 > 0 else 1.0
-                else:
-                    features[feat] = 1.0
-            elif feat == 'price_vs_sma_fast':
-                if len(history) >= 72:
-                    sma_72 = np.mean([h.get('close', 0) for h in history[-72:]])
-                    features[feat] = row.get('close', 0) / sma_72 if sma_72 > 0 else 1.0
-                else:
-                    features[feat] = 1.0
-            elif feat == 'price_vs_sma_slow':
-                if len(history) >= 168:
-                    sma_168 = np.mean([h.get('close', 0) for h in history[-168:]])
-                    features[feat] = row.get('close', 0) / sma_168 if sma_168 > 0 else 1.0
-                else:
-                    features[feat] = 1.0
-            elif feat == 'rsi_slope_3h':
-                if len(history) >= 3:
-                    rsi_now = row.get('rsi_14', 50)
-                    rsi_3h_ago = history[-3].get('rsi_14', 50)
-                    features[feat] = rsi_now - rsi_3h_ago
-                else:
-                    features[feat] = 0.0
-            elif feat == 'vol_regime_prob':
-                features[feat] = row.get('prediction_prob', 0.5)
-            else:
-                features[feat] = 0.0  # Default
-        
-        # Convert to array in correct order
-        return np.array([features.get(f, 0.0) for f in self.feature_names])
+    # Step 1: Generate trade labels from training data
+    # Step 2: Train XGBoost on training labels
+    # Step 3: Validate threshold selection on val data
+    # Step 4: Final test on test data
     
-    def predict_win_probability(
-        self,
-        row: dict,
-        history: List[dict],
-    ) -> float:
-        """
-        Predict probability that trade will be a WIN.
-        
-        Args:
-            row: Current bar data
-            history: Previous bars
-            
-        Returns:
-            Probability [0, 1] that trade will be WIN
-        """
-        if not self.is_ready():
-            return 0.5  # Neutral if model not loaded
-        
-        features = self.extract_features(row, history)
-        dmatrix = xgb.DMatrix(features.reshape(1, -1), feature_names=self.feature_names)
-        
-        prob = self.model.predict(dmatrix)[0]
-        return float(prob)
-    
-    def should_trade(
-        self,
-        row: dict,
-        history: List[dict],
-        threshold: Optional[float] = None,
-    ) -> bool:
-        """
-        Determine if trade should be taken.
-        
-        Args:
-            row: Current bar data
-            history: Previous bars
-            threshold: Probability threshold (default: self.default_threshold)
-            
-        Returns:
-            True if model predicts WIN with probability >= threshold
-        """
-        if not self.is_ready():
-            return True  # Allow trade if model not loaded
-        
-        threshold = threshold or self.default_threshold
-        prob = self.predict_win_probability(row, history)
-        
-        return prob >= threshold
+    return {
+        'train_samples': n_train,
+        'val_samples': n_val,
+        'test_samples': n_test
+    }
+```
 
+---
 
-# Singleton instance for easy import
-_default_filter = None
+### Phase 4: Statistical Significance Testing
 
-def get_trade_filter(threshold: float = 0.5) -> TradeQualityFilter:
-    """Get or create default trade filter instance."""
-    global _default_filter
-    if _default_filter is None:
-        _default_filter = TradeQualityFilter(default_threshold=threshold)
-    return _default_filter
+#### Task 4.1: Bootstrap Confidence Intervals
+
+```python
+def bootstrap_confidence_interval(returns: list, n_bootstrap: int = 1000, 
+                                   confidence: float = 0.95) -> tuple:
+    """
+    Calculate bootstrap confidence interval for returns.
+    """
+    import numpy as np
+    
+    bootstrap_means = []
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(returns, size=len(returns), replace=True)
+        bootstrap_means.append(np.mean(sample))
+    
+    lower = np.percentile(bootstrap_means, (1 - confidence) / 2 * 100)
+    upper = np.percentile(bootstrap_means, (1 + confidence) / 2 * 100)
+    
+    return lower, upper
+```
+
+#### Task 4.2: Monte Carlo Permutation Test
+
+```python
+def permutation_test(strategy_returns: list, baseline_returns: list, 
+                     n_permutations: int = 10000) -> float:
+    """
+    Test if strategy significantly outperforms baseline.
+    
+    Returns:
+        p-value for null hypothesis that strategy = baseline
+    """
+    observed_diff = np.mean(strategy_returns) - np.mean(baseline_returns)
+    
+    combined = strategy_returns + baseline_returns
+    n_strategy = len(strategy_returns)
+    
+    count_extreme = 0
+    for _ in range(n_permutations):
+        np.random.shuffle(combined)
+        perm_strategy = combined[:n_strategy]
+        perm_baseline = combined[n_strategy:]
+        perm_diff = np.mean(perm_strategy) - np.mean(perm_baseline)
+        
+        if perm_diff >= observed_diff:
+            count_extreme += 1
+    
+    return count_extreme / n_permutations
 ```
 
 ---
 
 ## Success Criteria
 
-After implementation, run backtests and verify:
+### Primary Metrics (ALL must pass):
+| Metric | Threshold | Description |
+|--------|-----------|-------------|
+| Positive Returns | ALL periods | Strategy must be profitable in bear AND bull markets |
+| Win Rate | > 60% | Consistent edge across market conditions |
+| Sharpe Ratio | > 0.5 | Risk-adjusted returns acceptable |
+| Max Drawdown | < 20% | Manageable risk profile |
 
-1. **Win Rate Improvement**: TrendStrengthML achieves 73-83% win rate (up from ~58%)
-2. **Maintained Returns**: Return >= 3% (allowing slight decrease for higher quality trades)
-3. **Reduced Trades**: Fewer trades (8-10 vs 12), but higher quality
-4. **Sharpe Ratio**: Maintained or improved (>= 2.5)
-5. **Feature Importance**: Top features make intuitive sense
-
----
-
-## Troubleshooting
-
-### Issue: Too few labeled samples
-**Solution**: Run strategy on full 365 days, not just test period. May need to lower entry thresholds temporarily to generate more trades for training.
-
-### Issue: Class imbalance
-**Solution**: Use `scale_pos_weight` in XGBoost, or undersample majority class.
-
-### Issue: Overfitting
-**Solution**: 
-- Reduce `max_depth` to 3
-- Increase `min_child_weight` to 10
-- Increase regularization (`reg_alpha`, `reg_lambda`)
-- Use cross-validation
-
-### Issue: Model not improving win rate
-**Solution**: 
-- Add more features (price patterns, volume analysis)
-- Try different thresholds
-- Ensemble with other models
+### Secondary Metrics (Desirable):
+| Metric | Target | Description |
+|--------|--------|-------------|
+| Trade Count | > 5 per 90 days | Sufficient sample size |
+| Consistency | σ(returns) < 5% | Low variance across periods |
+| Beat Baseline | > 0 pp | Improvement over TrendStrength |
 
 ---
 
-## Next Steps After V5
+## Execution Order
 
-1. **Walk-Forward Optimization**: Retrain model periodically on rolling windows
-2. **Multi-Model Ensemble**: Combine XGBoost with other classifiers (LightGBM, RandomForest)
-3. **Dynamic Threshold**: Adjust threshold based on market conditions
-4. **Position Sizing**: Use win probability to size positions (higher prob = larger position)
+### Step 1: Data Collection (30 min)
+```bash
+cd btc_volatility_predictor
+python fetch_historical_periods.py
+```
+
+### Step 2: Feature Engineering (15 min)
+```bash
+python -c "from data.features import prepare_dataset; \
+  prepare_dataset('data/raw/historical/btcusdt_1h_2018_bear.csv', 'data/processed/historical/features_2018_bear.csv'); \
+  prepare_dataset('data/raw/historical/btcusdt_1h_2019_2020_recovery.csv', 'data/processed/historical/features_2019_2020_recovery.csv'); \
+  prepare_dataset('data/raw/historical/btcusdt_1h_2023_2024_bull.csv', 'data/processed/historical/features_2023_2024_bull.csv')"
+```
+
+### Step 3: Run Multi-Period Backtest (20 min)
+```bash
+python backtest/run_backtest_multiperiod.py
+```
+
+### Step 4: Review Results
+- Check `backtest/results_multiperiod/robustness_results.json`
+- Verify all success criteria are met
+- If any period fails, investigate and potentially retrain
+
+---
+
+## Expected Outcomes
+
+### If Strategy is Robust:
+- Consistent positive returns across all market types
+- Win rate remains above 60% in bear and bull markets
+- XGBoost filter effectively removes losing trades in all conditions
+
+### If Strategy is Overfit:
+- Strong performance in one market type, weak in others
+- Win rate drops significantly in different market conditions
+- Returns correlation with specific market regime
+
+### Action Items on Failure:
+1. **Retrain XGBoost** with data from multiple market cycles
+2. **Adjust ML threshold** (try 0.55, 0.6, 0.65)
+3. **Review features** - some may be period-specific
+4. **Ensemble approach** - train separate models for bull/bear detection
+
+---
+
+## File Structure
+
+```
+btc_volatility_predictor/
+├── data/
+│   ├── raw/
+│   │   └── historical/
+│   │       ├── btcusdt_1h_2018_bear.csv
+│   │       ├── btcusdt_1h_2019_2020_recovery.csv
+│   │       └── btcusdt_1h_2023_2024_bull.csv
+│   └── processed/
+│       └── historical/
+│           ├── features_2018_bear.csv
+│           ├── features_2019_2020_recovery.csv
+│           └── features_2023_2024_bull.csv
+├── backtest/
+│   ├── run_backtest_v5.py (existing - baseline)
+│   ├── run_backtest_multiperiod.py (NEW)
+│   └── results_multiperiod/
+│       └── robustness_results.json
+└── ROBUSTNESS_TESTING_INSTRUCTIONS.md (this file)
+```
+
+---
+
+## Notes for Implementation
+
+1. **Rate Limiting**: Binance API has rate limits. Use `time.sleep(0.1)` between requests.
+
+2. **Memory Management**: Large datasets (~700 days = 16,800 hourly candles). Process one period at a time.
+
+3. **Random Seed**: Set `random.seed(42)` for reproducibility when generating random windows.
+
+4. **Model Caching**: The XGBoost model at `checkpoints/trade_classifier.json` was trained on recent data. For true robustness, consider retraining on combined historical data.
+
+5. **Feature Availability**: Ensure ADX and other indicators are calculated for historical periods. The existing `data/features.py` should handle this.
+
+---
+
+## References
+
+- Current best model: `python backtest/run_backtest_v5.py`
+- TrendStrengthML_50 implementation: `backtest/strategies/simple_adx.py`
+- XGBoost training: `ml/train_xgboost.py`
+- Feature engineering: `data/features.py`
