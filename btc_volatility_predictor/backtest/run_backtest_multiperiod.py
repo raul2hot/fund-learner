@@ -419,11 +419,11 @@ def train_volatility_model(
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        # Training loop (simplified, reduced epochs for faster testing)
+        # Training loop
         best_val_loss = float('inf')
-        patience = 5  # Reduced patience for faster convergence
+        patience = 10
         patience_counter = 0
-        max_epochs = 20  # Reduced from 50 for faster training
+        max_epochs = 50
 
         if verbose:
             print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
