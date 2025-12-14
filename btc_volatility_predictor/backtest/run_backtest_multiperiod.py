@@ -381,6 +381,9 @@ def train_volatility_model(
         config = Config()
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        if verbose:
+            print(f"    Using device: {device}")
+
         # Create datasets
         train_dataset = VolatilityRegimeDataset(
             train_df,
@@ -396,6 +399,13 @@ def train_volatility_model(
             feature_scaler=train_dataset.feature_scaler,
             vol_threshold=train_dataset.vol_threshold
         )
+
+        if verbose:
+            print(f"    Volatility threshold (p50): {train_dataset.vol_threshold:.6f}")
+            print(f"    Train samples: {len(train_dataset)}, Val: {len(val_dataset)}")
+            # Check class balance
+            train_pos = train_dataset.targets[train_dataset.window_size:].mean()
+            print(f"    Train class balance: {train_pos:.1%} high volatility")
 
         if len(train_dataset) < 100:
             if verbose:
@@ -418,6 +428,9 @@ def train_volatility_model(
         # Create model with config object
         model = SPHNet(config).to(device)
 
+        if verbose:
+            print(f"    Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
         # Use config values like train_regime_extended.py
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -432,9 +445,6 @@ def train_volatility_model(
         patience = config.patience
         patience_counter = 0
         max_epochs = config.epochs
-
-        if verbose:
-            print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
         for epoch in range(max_epochs):
             model.train()
