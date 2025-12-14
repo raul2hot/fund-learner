@@ -48,6 +48,17 @@ except ImportError as e:
     print(f"Warning: ML modules not available ({e}). Walk-forward training disabled.")
     ML_AVAILABLE = False
 
+# Import SPHNet for volatility regime training
+try:
+    import torch
+    from train_regime import VolatilityRegimeDataset, create_regime_dataloaders
+    from models import SPHNet
+    from config import Config
+    SPHNET_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: SPHNet modules not available ({e}). Volatility model training disabled.")
+    SPHNET_AVAILABLE = False
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -259,6 +270,235 @@ def generate_random_windows(
 
 
 # =============================================================================
+# WALK-FORWARD VOLATILITY MODEL TRAINING
+# =============================================================================
+
+def train_volatility_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    period_name: str,
+    output_dir: Optional[str] = None,
+    verbose: bool = True
+) -> Optional[str]:
+    """
+    Train SPHNet volatility regime model for a specific period.
+
+    Args:
+        train_df: Training data DataFrame
+        val_df: Validation data DataFrame
+        period_name: Name of the period
+        output_dir: Directory to save the model
+        verbose: Whether to print progress
+
+    Returns:
+        Path to saved model, or None if training failed
+    """
+    if not SPHNET_AVAILABLE:
+        if verbose:
+            print("    SPHNet not available, using threshold-based regime")
+        return None
+
+    # Use absolute path for output directory
+    if output_dir is None:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(base_dir, "checkpoints", "multiperiod")
+    elif not os.path.isabs(output_dir):
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(base_dir, output_dir)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        config = Config()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Create datasets
+        train_dataset = VolatilityRegimeDataset(
+            train_df,
+            window_size=config.window_size,
+            percentile=50,
+            fit_scalers=True
+        )
+
+        val_dataset = VolatilityRegimeDataset(
+            val_df,
+            window_size=config.window_size,
+            price_scaler=train_dataset.price_scaler,
+            feature_scaler=train_dataset.feature_scaler,
+            vol_threshold=train_dataset.vol_threshold
+        )
+
+        if len(train_dataset) < 100:
+            if verbose:
+                print(f"    WARNING: Only {len(train_dataset)} training samples, skipping SPHNet")
+            return None
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=32, shuffle=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=32, shuffle=False
+        )
+
+        # Create model
+        model = SPHNet(
+            n_price_features=len(train_dataset.price_cols),
+            n_eng_features=len(train_dataset.eng_cols),
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_encoder_layers=config.n_encoder_layers,
+            dropout=config.dropout,
+            output_dim=1  # Binary classification
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+        criterion = torch.nn.BCEWithLogitsLoss()
+
+        # Training loop (simplified)
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+
+        if verbose:
+            print(f"    Training SPHNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
+
+        for epoch in range(50):  # Max epochs
+            model.train()
+            train_loss = 0
+            for batch in train_loader:
+                prices = batch['prices'].to(device)
+                features = batch['features'].to(device)
+                targets = batch['target'].to(device)
+
+                optimizer.zero_grad()
+                outputs = model(prices, features).squeeze()
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            # Validation
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    prices = batch['prices'].to(device)
+                    features = batch['features'].to(device)
+                    targets = batch['target'].to(device)
+                    outputs = model(prices, features).squeeze()
+                    val_loss += criterion(outputs, targets).item()
+
+            val_loss /= len(val_loader)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                model_path = os.path.join(output_dir, f"sphnet_{period_name}.pt")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'vol_threshold': train_dataset.vol_threshold,
+                    'price_scaler': train_dataset.price_scaler,
+                    'feature_scaler': train_dataset.feature_scaler,
+                    'price_cols': train_dataset.price_cols,
+                    'eng_cols': train_dataset.eng_cols,
+                }, model_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
+        if verbose:
+            print(f"    SPHNet trained, best val loss: {best_val_loss:.4f}")
+            print(f"    Model saved to {model_path}")
+
+        return model_path
+
+    except Exception as e:
+        if verbose:
+            print(f"    ERROR training SPHNet: {e}")
+        return None
+
+
+def generate_regime_predictions_with_model(
+    df: pd.DataFrame,
+    model_path: str,
+    verbose: bool = False
+) -> pd.DataFrame:
+    """
+    Generate regime predictions using trained SPHNet model.
+
+    Args:
+        df: DataFrame with features
+        model_path: Path to trained SPHNet model
+        verbose: Whether to print progress
+
+    Returns:
+        DataFrame with predicted_regime column
+    """
+    df = df.copy()
+
+    if not SPHNET_AVAILABLE or not os.path.exists(model_path):
+        # Fall back to threshold-based
+        return prepare_regime_predictions(df)
+
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Load model
+        checkpoint = torch.load(model_path, map_location=device)
+
+        config = Config()
+        model = SPHNet(
+            n_price_features=len(checkpoint['price_cols']),
+            n_eng_features=len(checkpoint['eng_cols']),
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_encoder_layers=config.n_encoder_layers,
+            dropout=0,  # No dropout at inference
+            output_dim=1
+        ).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        # Create dataset for prediction
+        dataset = VolatilityRegimeDataset(
+            df,
+            window_size=config.window_size,
+            price_scaler=checkpoint['price_scaler'],
+            feature_scaler=checkpoint['feature_scaler'],
+            vol_threshold=checkpoint['vol_threshold']
+        )
+
+        # Generate predictions
+        predictions = []
+        with torch.no_grad():
+            for i in range(len(dataset)):
+                batch = dataset[i]
+                prices = batch['prices'].unsqueeze(0).to(device)
+                features = batch['features'].unsqueeze(0).to(device)
+                output = torch.sigmoid(model(prices, features)).item()
+                predictions.append(1 if output > 0.5 else 0)
+
+        # Pad predictions to match df length
+        pad_length = len(df) - len(predictions)
+        full_predictions = [0] * pad_length + predictions
+
+        df['predicted_regime'] = full_predictions
+
+        if verbose:
+            high_pct = sum(full_predictions) / len(full_predictions) * 100
+            print(f"    SPHNet predictions: {high_pct:.1f}% HIGH volatility")
+
+        return df
+
+    except Exception as e:
+        if verbose:
+            print(f"    ERROR generating predictions: {e}")
+        return prepare_regime_predictions(df)
+
+
+# =============================================================================
 # WALK-FORWARD XGBOOST TRAINING
 # =============================================================================
 
@@ -447,22 +687,24 @@ def train_period_model(
 
 def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = True) -> Dict:
     """
-    Walk-forward analysis with proper XGBoost training on each period.
+    Walk-forward analysis with proper model training on each period.
 
     Split:
-    - Train: First 70% of data (used for XGBoost training)
+    - Train: First 70% of data (used for model training)
     - Validate: Next 15% of data (used for early stopping)
     - Test: Final 15% of data (out-of-sample evaluation)
 
     For each period:
-    1. Generate trade labels from training data
-    2. Train XGBoost classifier on those labels
-    3. Test on val/test splits with freshly trained model
+    1. Train SPHNet volatility model on training data
+    2. Generate regime predictions using trained SPHNet
+    3. Generate trade labels from training data
+    4. Train XGBoost classifier on those labels
+    5. Test on val/test splits with both freshly trained models
 
     Args:
         df: DataFrame with features
         period_name: Name of the period for logging
-        train_model: Whether to train a new model (True) or use existing
+        train_model: Whether to train new models (True) or use existing
 
     Returns:
         Dict with walk-forward results
@@ -485,21 +727,36 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         'train_samples': n_train,
         'val_samples': n_val,
         'test_samples': n_test,
-        'model_path': None,
+        'sphnet_path': None,
+        'xgb_model_path': None,
         'splits': {}
     }
 
-    # Step 1: Train XGBoost on training data
-    model_path = None
-    if train_model and ML_AVAILABLE:
-        print(f"\n  Training period-specific XGBoost model...")
-        model_path = train_period_model(train_df, val_df, period_name)
-        results['model_path'] = model_path
+    # Step 1: Train SPHNet volatility model on training data
+    sphnet_path = None
+    if train_model and SPHNET_AVAILABLE:
+        print(f"\n  Step 1: Training SPHNet volatility model...")
+        sphnet_path = train_volatility_model(train_df, val_df, period_name)
+        results['sphnet_path'] = sphnet_path
 
-        if model_path:
-            # Update the global model path for TrendStrengthWithML to use
-            # We need to temporarily set the model for testing
-            print(f"    Using trained model for evaluation")
+    # Step 2: Generate regime predictions for training data using trained SPHNet
+    if sphnet_path:
+        print(f"\n  Step 2: Generating regime predictions with trained SPHNet...")
+        train_df_with_regime = generate_regime_predictions_with_model(train_df, sphnet_path)
+        val_df_with_regime = generate_regime_predictions_with_model(val_df, sphnet_path)
+    else:
+        train_df_with_regime = prepare_regime_predictions(train_df)
+        val_df_with_regime = prepare_regime_predictions(val_df)
+
+    # Step 3: Train XGBoost on training data with regime predictions
+    xgb_model_path = None
+    if train_model and ML_AVAILABLE:
+        print(f"\n  Step 3: Training XGBoost trade classifier...")
+        xgb_model_path = train_period_model(train_df_with_regime, val_df_with_regime, period_name)
+        results['xgb_model_path'] = xgb_model_path
+
+        if xgb_model_path:
+            print(f"    Using trained XGBoost for evaluation")
 
     engine = BacktestEngine(
         initial_capital=INITIAL_CAPITAL,
@@ -507,20 +764,24 @@ def walk_forward_test(df: pd.DataFrame, period_name: str, train_model: bool = Tr
         slippage=SLIPPAGE
     )
 
-    # Step 2: Evaluate on each split
+    # Step 4: Evaluate on each split
+    print(f"\n  Step 4: Evaluating on train/val/test splits...")
     for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
         if len(split_df) < 168:  # Need warmup
             results['splits'][split_name] = {'error': 'Insufficient data'}
             continue
 
-        # Prepare data with regime predictions
-        split_df = prepare_regime_predictions(split_df)
+        # Generate regime predictions using trained SPHNet (or threshold)
+        if sphnet_path:
+            split_df = generate_regime_predictions_with_model(split_df, sphnet_path)
+        else:
+            split_df = prepare_regime_predictions(split_df)
 
-        # Create strategy with period-specific model if available
-        if model_path and os.path.exists(model_path):
-            features_path = model_path.replace('.json', '_features.json')
+        # Create strategy with period-specific XGBoost model if available
+        if xgb_model_path and os.path.exists(xgb_model_path):
+            features_path = xgb_model_path.replace('.json', '_features.json')
             strategy = TrendStrengthWithML(
-                ml_model_path=model_path,
+                ml_model_path=xgb_model_path,
                 ml_features_path=features_path,
                 ml_threshold=0.5
             )
