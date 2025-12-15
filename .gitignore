@@ -223,6 +223,14 @@ sph_net/.venv
 data/raw/
 data/processed/
 data/interim/
+data/aligned/
+data/featured/
+data/final/
+data/daily/
+data/reports/
+data/cache/
+data/kaggle/*.csv
+!data/kaggle/README.md
 
 # Model checkpoints and weights
 *.pt
