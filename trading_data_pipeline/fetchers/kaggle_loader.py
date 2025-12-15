@@ -23,46 +23,51 @@ class KaggleLoader:
     """
 
     # Dataset configurations
+    # Column names match the actual Kaggle CSV files
     KAGGLE_DATASETS: Dict[str, Dict[str, Any]] = {
         'open_interest': {
             'kaggle_slug': 'jesusgraterol/bitcoin-open-interest-binance-futures',
             'filename': 'open_interest.csv',
-            'timestamp_col': 'ot',  # Open time
-            'value_cols': ['soi', 'soiv'],  # Sum OI, Sum OI Value
+            'timestamp_col': 'timestamp',
+            'timestamp_format': 'ms',  # milliseconds
+            'value_cols': ['sum_open_interest', 'sum_open_interest_value'],
             'rename_map': {
-                'soi': 'sumOpenInterest',
-                'soiv': 'sumOpenInterestValue',
+                'sum_open_interest': 'sumOpenInterest',
+                'sum_open_interest_value': 'sumOpenInterestValue',
             },
         },
         'long_short_ratio': {
             'kaggle_slug': 'jesusgraterol/bitcoin-longshort-ratio-binance-futures',
             'filename': 'long_short_ratio.csv',
-            'timestamp_col': 'ot',
-            'value_cols': ['lsr', 'la', 'sa'],  # LS Ratio, Long Acct, Short Acct
+            'timestamp_col': 'timestamp',
+            'timestamp_format': 'ms',
+            'value_cols': ['long_short_ratio', 'long_account', 'short_account'],
             'rename_map': {
-                'lsr': 'longShortRatio',
-                'la': 'longAccount',
-                'sa': 'shortAccount',
+                'long_short_ratio': 'longShortRatio',
+                'long_account': 'longAccount',
+                'short_account': 'shortAccount',
             },
         },
         'taker_volume': {
             'kaggle_slug': 'jesusgraterol/bitcoin-taker-buysell-volume-binance-futures',
             'filename': 'taker_buy_sell_volume.csv',
-            'timestamp_col': 'ot',
-            'value_cols': ['bsr', 'bv', 'sv'],  # Buy/Sell Ratio, Buy Vol, Sell Vol
+            'timestamp_col': 'timestamp',
+            'timestamp_format': 'ms',
+            'value_cols': ['buy_sell_ratio', 'buy_vol', 'sell_vol'],
             'rename_map': {
-                'bsr': 'buySellRatio',
-                'bv': 'buyVol',
-                'sv': 'sellVol',
+                'buy_sell_ratio': 'buySellRatio',
+                'buy_vol': 'buyVol',
+                'sell_vol': 'sellVol',
             },
         },
         'funding_rate': {
             'kaggle_slug': 'jesusgraterol/bitcoin-funding-rate-binance-futures',
             'filename': 'funding_rate.csv',
-            'timestamp_col': 'ct',  # Close time
-            'value_cols': ['fr'],  # Funding Rate
+            'timestamp_col': 'timestamp',
+            'timestamp_format': 'ms',
+            'value_cols': ['funding_rate'],
             'rename_map': {
-                'fr': 'fundingRate',
+                'funding_rate': 'fundingRate',
             },
         },
     }
@@ -108,7 +113,24 @@ class KaggleLoader:
 
         # Standardize timestamp
         ts_col = config['timestamp_col']
-        df['timestamp'] = pd.to_datetime(df[ts_col], unit='ms', utc=True)
+        ts_format = config.get('timestamp_format', 'ms')
+
+        # Handle different timestamp formats
+        if ts_format == 'ms':
+            # Try milliseconds first, fall back to auto-detect
+            try:
+                df['timestamp'] = pd.to_datetime(df[ts_col], unit='ms', utc=True)
+            except (ValueError, OverflowError):
+                # Try auto-parsing (ISO format, etc.)
+                df['timestamp'] = pd.to_datetime(df[ts_col], utc=True)
+        elif ts_format == 's':
+            df['timestamp'] = pd.to_datetime(df[ts_col], unit='s', utc=True)
+        else:
+            df['timestamp'] = pd.to_datetime(df[ts_col], utc=True)
+
+        # Ensure timezone aware
+        if df['timestamp'].dt.tz is None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
 
         # Rename columns
         df = df.rename(columns=config['rename_map'])

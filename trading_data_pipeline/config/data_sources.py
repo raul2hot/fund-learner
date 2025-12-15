@@ -69,7 +69,7 @@ FEAR_GREED_SOURCE = DataSource(
     publication_delay=pd.Timedelta(hours=9),  # Published ~09:00 UTC
     resample_method=ResampleMethod.FORWARD_FILL_LIMIT,
     fill_limit_hours=36,  # Max ~1.5 days stale
-    value_columns=['value', 'value_classification']
+    value_columns=['value']  # 'classification' is categorical, handled separately
 )
 
 OPEN_INTEREST_SOURCE = DataSource(
