@@ -143,6 +143,11 @@ class TemporalSplitter:
         train_end_date = pd.to_datetime(self.config.train_end_date)
         val_end_date = pd.to_datetime(self.config.val_end_date)
 
+        # Handle timezone-aware timestamps
+        if df[timestamp_col].dt.tz is not None:
+            train_end_date = train_end_date.tz_localize('UTC')
+            val_end_date = val_end_date.tz_localize('UTC')
+
         train_df = df[df[timestamp_col] < train_end_date].copy()
         val_df = df[(df[timestamp_col] >= train_end_date) &
                     (df[timestamp_col] < val_end_date)].copy()
