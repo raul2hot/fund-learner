@@ -2,26 +2,146 @@
 
 **Clean Architecture: Binance API + Alternative.me**
 
-*Last Updated: December 15, 2025*
+*Last Updated: December 16, 2025*
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [Data Sources](#2-data-sources)
-3. [Filter-to-Data Mapping](#3-filter-to-data-mapping)
-4. [Installation & Setup](#4-installation--setup)
-5. [Data Fetching Module](#5-data-fetching-module)
-6. [Data Alignment & Preprocessing](#6-data-alignment--preprocessing)
-7. [Edge Case Handling](#7-edge-case-handling)
-8. [Complete Pipeline](#8-complete-pipeline)
-9. [Data Validation](#9-data-validation)
-10. [Usage Examples](#10-usage-examples)
+1. [Quick Start](#1-quick-start)
+2. [CLI Commands](#2-cli-commands)
+3. [Step-by-Step Guide](#3-step-by-step-guide)
+4. [Overview](#4-overview)
+5. [Data Sources](#5-data-sources)
+6. [Filter-to-Data Mapping](#6-filter-to-data-mapping)
+7. [Installation & Setup](#7-installation--setup)
+8. [Data Alignment](#8-data-alignment)
+9. [Output Format](#9-output-format)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
-## 1. Overview
+## 1. Quick Start
+
+```bash
+# Navigate to the data pipeline directory
+cd data_pipleine
+
+# Quick test (last 7 days of data)
+python main_pipeline.py --test
+
+# Full data fetch (2 years for training)
+python main_pipeline.py --start 2023-01-01 --end 2024-12-31
+
+# Custom symbol and output directory
+python main_pipeline.py --start 2023-01-01 --symbol ETHUSDT --output ./eth_data
+```
+
+---
+
+## 2. CLI Commands
+
+### Main Pipeline Commands
+
+| Command | Description |
+|---------|-------------|
+| `python main_pipeline.py --test` | Quick test with last 7 days of data |
+| `python main_pipeline.py --start YYYY-MM-DD` | Fetch data from start date to today |
+| `python main_pipeline.py --start YYYY-MM-DD --end YYYY-MM-DD` | Fetch data for specific date range |
+| `python main_pipeline.py --symbol ETHUSDT` | Fetch data for different trading pair |
+| `python main_pipeline.py --output ./custom_dir` | Save to custom output directory |
+| `python main_pipeline.py --save-intermediate` | Save intermediate data files |
+
+### Testing Individual Components
+
+```bash
+# Test data fetcher only
+python data_fetcher.py
+
+# Test with custom date range
+python -c "
+from data_fetcher import BinanceFetcher
+fetcher = BinanceFetcher()
+df = fetcher.fetch_klines(start_date='2025-12-01', end_date='2025-12-10')
+print(df.head())
+"
+```
+
+---
+
+## 3. Step-by-Step Guide
+
+### Step 1: Install Dependencies
+
+```bash
+pip install pandas numpy requests python-dateutil tqdm
+```
+
+### Step 2: (Optional) Set Up Binance API Key
+
+```bash
+# Set environment variable for better rate limits
+export BINANCE_API_KEY="your_api_key_here"
+```
+
+### Step 3: Run Quick Test
+
+```bash
+cd data_pipleine
+python main_pipeline.py --test
+```
+
+Expected output:
+```
+============================================================
+QUICK TEST - Last 7 days of data
+============================================================
+Starting ML Data Pipeline
+Symbol: BTCUSDT
+Date Range: 2025-12-09 to 2025-12-16
+============================================================
+[1/5] Fetching data from sources...
+[2/5] Handling edge cases...
+[3/5] Merging and aligning data...
+[4/5] Computing derived features...
+[5/5] Validating and exporting...
+Data validation passed!
+```
+
+### Step 4: Fetch Full Training Data
+
+```bash
+# Fetch 2 years of data for ML training
+python main_pipeline.py --start 2023-01-01 --end 2024-12-31 --output ./ml_data
+```
+
+### Step 5: Verify Output Files
+
+```bash
+ls -la ./ml_data/
+# Expected files:
+# - BTCUSDT_ml_data.parquet  (efficient for ML)
+# - BTCUSDT_ml_data.csv      (for inspection)
+# - BTCUSDT_metadata.json    (pipeline metadata)
+```
+
+### Step 6: Load Data in Python
+
+```python
+import pandas as pd
+
+# Load the data
+df = pd.read_parquet('./ml_data/BTCUSDT_ml_data.parquet')
+
+# Check shape and columns
+print(f"Shape: {df.shape}")
+print(f"Columns: {list(df.columns)}")
+print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+```
+
+---
+
+## 4. Overview
 
 ### Architecture
 
@@ -32,16 +152,16 @@
 │                                                                  │
 │  BINANCE FUTURES API (with API key):                            │
 │  ─────────────────────────────────────                          │
-│  • OHLCV 1h candles        → Full history (Sept 2019+)          │
-│  • Taker Buy Volume        → Included in OHLCV response [9]     │
-│  • Funding Rate            → Full history (8h intervals)        │
+│  - OHLCV 1h candles        -> Full history (Sept 2019+)         │
+│  - Taker Buy Volume        -> Included in OHLCV response [9]    │
+│  - Funding Rate            -> Full history (8h intervals)       │
 │                                                                  │
 │  ALTERNATIVE.ME API (no key required):                          │
 │  ─────────────────────────────────────                          │
-│  • Fear & Greed Index      → Full history (Feb 2018+)           │
+│  - Fear & Greed Index      -> Full history (Feb 2018+)          │
 │                                                                  │
 │  COST: $0                                                        │
-│  FILTERS SUPPORTED: 10/10 ✓                                      │
+│  FILTERS SUPPORTED: 10/10                                        │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -50,15 +170,15 @@
 
 1. **Point-in-Time Correctness**: All features use only data available at prediction time
 2. **Timestamp Alignment**: All data aligned to hourly UTC boundaries
-3. **No Look-Ahead Bias**: Funding rate forward-filled (8h→1h), Fear/Greed forward-filled (daily→1h)
+3. **No Look-Ahead Bias**: Funding rate forward-filled (8h->1h), Fear/Greed forward-filled (daily->1h)
 4. **Robust Edge Case Handling**: NaN interpolation, gap detection, validation checks
 5. **Clean Single-Source Architecture**: No Kaggle dependencies, direct API access
 
 ---
 
-## 2. Data Sources
+## 5. Data Sources
 
-### 2.1 Binance Futures API
+### 5.1 Binance Futures API
 
 **Base URL**: `https://fapi.binance.com`
 
@@ -107,7 +227,7 @@ Index  Field                        Type     Used For
 }
 ```
 
-### 2.2 Alternative.me Fear & Greed API
+### 5.2 Alternative.me Fear & Greed API
 
 **Base URL**: `https://api.alternative.me`
 
@@ -144,7 +264,7 @@ Index  Field                        Type     Used For
 
 ---
 
-## 3. Filter-to-Data Mapping
+## 6. Filter-to-Data Mapping
 
 | # | Filter | Required Data | Source | Availability |
 |---|--------|---------------|--------|--------------|
@@ -163,15 +283,15 @@ Index  Field                        Type     Used For
 
 ---
 
-## 4. Installation & Setup
+## 7. Installation & Setup
 
-### 4.1 Dependencies
+### 7.1 Dependencies
 
 ```bash
 pip install pandas numpy requests python-dateutil tqdm
 ```
 
-### 4.2 API Key Setup (Recommended)
+### 7.2 API Key Setup (Recommended)
 
 While Binance public endpoints work without authentication, using an API key provides:
 - Better rate limit tracking via response headers
