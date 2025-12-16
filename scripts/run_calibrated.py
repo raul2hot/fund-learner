@@ -167,63 +167,67 @@ def compute_performance(
         trades['stopped_out'] = sl_results['stopped_out']
         trades['took_profit'] = sl_results['took_profit']
 
-        # Stop-loss specific metrics
-        metrics['n_stopped_out'] = sl_results['n_stopped']
-        metrics['n_took_profit'] = sl_results['n_took_profit']
-        metrics['pct_stopped'] = sl_results['pct_stopped']
-        metrics['original_total_return'] = sl_results['original_total_return']
-        metrics['sl_improvement'] = sl_results['improvement']
+        # Stop-loss specific metrics (ensure Python native types for JSON serialization)
+        metrics['n_stopped_out'] = int(sl_results['n_stopped'])
+        metrics['n_took_profit'] = int(sl_results['n_took_profit'])
+        metrics['pct_stopped'] = float(sl_results['pct_stopped'])
+        metrics['original_total_return'] = float(sl_results['original_total_return'])
+        metrics['sl_improvement'] = float(sl_results['improvement'])
 
-    # Long trades
+    # Long trades (ensure Python native types for JSON serialization)
     long_trades = trades[trades['is_long']]
     if len(long_trades) > 0:
-        metrics['long_trades'] = len(long_trades)
-        metrics['long_total_return'] = long_trades['trade_return'].sum() * 100
-        metrics['long_avg_return'] = long_trades['trade_return'].mean() * 100
-        metrics['long_win_rate'] = (long_trades['trade_return'] > 0).mean() * 100
-        metrics['long_correct_class'] = (long_trades['true_label'] == 0).mean() * 100
+        metrics['long_trades'] = int(len(long_trades))
+        metrics['long_total_return'] = float(long_trades['trade_return'].sum() * 100)
+        metrics['long_avg_return'] = float(long_trades['trade_return'].mean() * 100)
+        metrics['long_win_rate'] = float((long_trades['trade_return'] > 0).mean() * 100)
+        metrics['long_correct_class'] = float((long_trades['true_label'] == 0).mean() * 100)
         if 'stopped_out' in trades.columns:
-            metrics['long_stopped'] = long_trades['stopped_out'].sum()
+            metrics['long_stopped'] = int(long_trades['stopped_out'].sum())
 
     # Short trades
     short_trades = trades[~trades['is_long']]
     if len(short_trades) > 0:
-        metrics['short_trades'] = len(short_trades)
-        metrics['short_total_return'] = short_trades['trade_return'].sum() * 100
-        metrics['short_avg_return'] = short_trades['trade_return'].mean() * 100
-        metrics['short_win_rate'] = (short_trades['trade_return'] > 0).mean() * 100
-        metrics['short_correct_class'] = (short_trades['true_label'] == 4).mean() * 100
+        metrics['short_trades'] = int(len(short_trades))
+        metrics['short_total_return'] = float(short_trades['trade_return'].sum() * 100)
+        metrics['short_avg_return'] = float(short_trades['trade_return'].mean() * 100)
+        metrics['short_win_rate'] = float((short_trades['trade_return'] > 0).mean() * 100)
+        metrics['short_correct_class'] = float((short_trades['true_label'] == 4).mean() * 100)
         if 'stopped_out' in trades.columns:
-            metrics['short_stopped'] = short_trades['stopped_out'].sum()
+            metrics['short_stopped'] = int(short_trades['stopped_out'].sum())
 
-    # Combined
-    metrics['total_return'] = trades['trade_return'].sum() * 100
-    metrics['avg_return_per_trade'] = trades['trade_return'].mean() * 100
-    metrics['overall_win_rate'] = (trades['trade_return'] > 0).mean() * 100
+    # Combined (ensure Python native types for JSON serialization)
+    metrics['total_return'] = float(trades['trade_return'].sum() * 100)
+    metrics['avg_return_per_trade'] = float(trades['trade_return'].mean() * 100)
+    metrics['overall_win_rate'] = float((trades['trade_return'] > 0).mean() * 100)
 
     # Sharpe ratio (annualized based on actual trading frequency)
     if trades['trade_return'].std() > 0:
         # Estimate trading days from total samples (assuming ~96 candles/day)
         trading_days = len(results_df) / 96
         trades_per_year = len(trades) * (365 / max(trading_days, 1))
-        metrics['sharpe_ratio'] = (
-            trades['trade_return'].mean() / trades['trade_return'].std()
-        ) * np.sqrt(trades_per_year)
-        metrics['trades_per_year'] = trades_per_year
+        metrics['sharpe_ratio'] = float(
+            (trades['trade_return'].mean() / trades['trade_return'].std())
+            * np.sqrt(trades_per_year)
+        )
+        metrics['trades_per_year'] = float(trades_per_year)
 
         # Also compute the original (overstated) for comparison
-        metrics['sharpe_ratio_original'] = (
-            trades['trade_return'].mean() / trades['trade_return'].std()
-        ) * np.sqrt(35000)
+        metrics['sharpe_ratio_original'] = float(
+            (trades['trade_return'].mean() / trades['trade_return'].std())
+            * np.sqrt(35000)
+        )
     else:
         metrics['sharpe_ratio'] = 0.0
         metrics['sharpe_ratio_original'] = 0.0
 
     # Tail risk metrics
-    metrics['worst_trade'] = trades['trade_return'].min() * 100
-    metrics['best_trade'] = trades['trade_return'].max() * 100
-    metrics['max_drawdown'] = (trades['trade_return'].cumsum().cummax() -
-                               trades['trade_return'].cumsum()).max() * 100
+    metrics['worst_trade'] = float(trades['trade_return'].min() * 100)
+    metrics['best_trade'] = float(trades['trade_return'].max() * 100)
+    metrics['max_drawdown'] = float(
+        (trades['trade_return'].cumsum().cummax() -
+         trades['trade_return'].cumsum()).max() * 100
+    )
 
     return metrics
 
