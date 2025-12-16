@@ -3,6 +3,7 @@
 Evaluation Script for SPH-Net
 
 Evaluates trained model on test set.
+Supports both standard 5-class and two-stage models.
 """
 
 import sys
@@ -16,6 +17,7 @@ import torch
 
 from sph_net.config import SPHNetConfig
 from sph_net.models.sph_net import SPHNet
+from sph_net.models.two_stage import TwoStageModel
 from data.dataset import TradingDataset
 from torch.utils.data import DataLoader
 from evaluation.evaluator import Evaluator
@@ -57,7 +59,17 @@ def main():
     checkpoint = torch.load(MODEL_DIR / "best_model.pt", map_location='cpu', weights_only=False)
     config = checkpoint['config']
 
-    model = SPHNet(config)
+    # Detect model type from config
+    model_type = getattr(config, 'model_type', 'standard')
+    logger.info(f"Model type: {model_type}")
+
+    if model_type == "two_stage":
+        model = TwoStageModel(config)
+        logger.info("Loaded Two-Stage Model")
+    else:
+        model = SPHNet(config)
+        logger.info("Loaded Standard 5-class Model")
+
     model.load_state_dict(checkpoint['model_state_dict'])
 
     # === Create Test DataLoader ===
