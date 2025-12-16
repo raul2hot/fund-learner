@@ -36,7 +36,7 @@ from features.feature_pipeline import FeaturePipeline
 from data.dataset import TradingDataset
 from torch.utils.data import DataLoader
 from sph_net.config import SPHNetConfig
-from sph_net.models.two_stage import TwoStageModel, TwoStageLoss, CalibratedTwoStageModel
+from sph_net.models.two_stage import TwoStageModel, TwoStageLoss, CalibratedTwoStageModel, apply_stop_loss_to_returns
 from training.trainer import Trainer
 from training.metrics import MetricTracker
 
@@ -87,7 +87,7 @@ def get_model_config(n_price_features: int, n_engineered_features: int, tradeabl
 INFERENCE_CONFIG = {
     'trade_threshold': 0.55,
     'filter_high_volatility': True,
-    'stop_loss_pct': None,  # Evaluate without stop-loss
+    'stop_loss_pct': -0.02,  # -2.0% stop-loss (critical for limiting tail risk)
 }
 
 # Test periods
@@ -418,14 +418,14 @@ def evaluate_period(
 
     results_df = pd.DataFrame(all_results)
 
-    # Compute metrics
-    metrics = compute_trading_metrics(results_df)
+    # Compute metrics with stop-loss
+    metrics = compute_trading_metrics(results_df, stop_loss_pct=INFERENCE_CONFIG['stop_loss_pct'])
 
     return metrics, results_df
 
 
-def compute_trading_metrics(results_df: pd.DataFrame) -> Dict:
-    """Compute comprehensive trading metrics."""
+def compute_trading_metrics(results_df: pd.DataFrame, stop_loss_pct: float = None) -> Dict:
+    """Compute comprehensive trading metrics with optional stop-loss."""
     trades = results_df[results_df['should_trade']].copy()
     n_total = len(results_df)
     n_trades = len(trades)
@@ -434,11 +434,13 @@ def compute_trading_metrics(results_df: pd.DataFrame) -> Dict:
         'total_samples': n_total,
         'n_trades': n_trades,
         'trade_frequency': n_trades / n_total * 100 if n_total > 0 else 0,
+        'stop_loss_pct': stop_loss_pct,
     }
 
     if n_trades == 0:
         metrics.update({
             'total_return': 0.0,
+            'total_return_no_sl': 0.0,
             'win_rate': 0.0,
             'avg_return_per_trade': 0.0,
             'sharpe_ratio': 0.0,
@@ -451,8 +453,28 @@ def compute_trading_metrics(results_df: pd.DataFrame) -> Dict:
             'short_trades': 0,
             'short_total_return': 0.0,
             'short_win_rate': 0.0,
+            'n_stopped_out': 0,
         })
         return metrics
+
+    # Store original returns before stop-loss
+    original_returns = trades['trade_return'].copy()
+    metrics['total_return_no_sl'] = float(original_returns.sum() * 100)
+
+    # Apply stop-loss if configured
+    if stop_loss_pct is not None:
+        mae_values = trades['trade_mae'].values if 'trade_mae' in trades.columns else None
+        sl_results = apply_stop_loss_to_returns(
+            trades['trade_return'].values,
+            stop_loss_pct=stop_loss_pct,
+            mae_values=mae_values,
+        )
+        trades['trade_return'] = sl_results['adjusted_returns']
+        metrics['n_stopped_out'] = int(sl_results['n_stopped'])
+        metrics['pct_stopped'] = float(sl_results['pct_stopped'])
+    else:
+        metrics['n_stopped_out'] = 0
+        metrics['pct_stopped'] = 0.0
 
     returns = trades['trade_return']
 
@@ -516,6 +538,7 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
     primary_ids = ['period_1_may2021', 'period_2_luna', 'period_3_ftx', 'period_4_etf']
 
     primary_returns = []
+    primary_returns_no_sl = []
     primary_sharpes = []
     total_trades = 0
 
@@ -523,11 +546,13 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
         if pid in period_results:
             r = period_results[pid]['metrics']
             primary_returns.append(r['total_return'])
+            primary_returns_no_sl.append(r.get('total_return_no_sl', r['total_return']))
             primary_sharpes.append(r['sharpe_ratio'])
             total_trades += r['n_trades']
 
     n_profitable = sum(1 for r in primary_returns if r > 0)
     avg_return = np.mean(primary_returns) if primary_returns else 0
+    avg_return_no_sl = np.mean(primary_returns_no_sl) if primary_returns_no_sl else 0
     avg_sharpe = np.mean(primary_sharpes) if primary_sharpes else 0
     worst_return = min(primary_returns) if primary_returns else 0
     best_return = max(primary_returns) if primary_returns else 0
@@ -548,6 +573,10 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
                 'strong_move_threshold': LABELING_CONFIG.strong_move_threshold,
                 'weak_move_threshold': LABELING_CONFIG.weak_move_threshold,
                 'clean_path_mae_threshold': LABELING_CONFIG.clean_path_mae_threshold,
+            },
+            'risk_management': {
+                'stop_loss_pct': INFERENCE_CONFIG['stop_loss_pct'],
+                'filter_high_volatility': INFERENCE_CONFIG['filter_high_volatility'],
             }
         },
         'periods': {
@@ -563,6 +592,7 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
         'aggregated': {
             'primary_periods_profitable': n_profitable,
             'average_return': float(avg_return),
+            'average_return_no_sl': float(avg_return_no_sl),
             'average_sharpe': float(avg_sharpe),
             'worst_period_return': float(worst_return),
             'best_period_return': float(best_return),
@@ -617,42 +647,48 @@ def compute_verdict(n_profitable: int, avg_return: float, avg_sharpe: float, wor
 def print_summary(summary: Dict):
     """Print formatted summary to console."""
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("WALK-FORWARD VALIDATION SUMMARY")
-    print("=" * 80)
+    sl_pct = INFERENCE_CONFIG['stop_loss_pct']
+    if sl_pct:
+        print(f"(With {sl_pct*100:.1f}% Stop-Loss Applied)")
+    print("=" * 100)
 
     print("\nPER-PERIOD RESULTS:")
-    print("-" * 80)
-    print(f"{'Period':<25} {'Return':>10} {'Sharpe':>10} {'Trades':>8} {'Win%':>8} {'Status':>10}")
-    print("-" * 80)
+    print("-" * 100)
+    print(f"{'Period':<20} {'Return':>10} {'NoSL':>10} {'Sharpe':>8} {'Trades':>7} {'Stop':>6} {'Win%':>7} {'Status':>10}")
+    print("-" * 100)
 
     for pid, data in summary['periods'].items():
         m = data['metrics']
         status = "PRIMARY" if data['is_primary'] else "BONUS"
         profitable = "PASS" if m['total_return'] > 0 else "FAIL"
-        print(f"{data['name']:<25} {m['total_return']:>+9.2f}% {m['sharpe_ratio']:>10.2f} "
-              f"{m['n_trades']:>8} {m['win_rate']:>7.1f}% {status:>10} {profitable}")
+        no_sl_return = m.get('total_return_no_sl', m['total_return'])
+        n_stopped = m.get('n_stopped_out', 0)
+        print(f"{data['name']:<20} {m['total_return']:>+9.2f}% {no_sl_return:>+9.2f}% {m['sharpe_ratio']:>8.2f} "
+              f"{m['n_trades']:>7} {n_stopped:>6} {m['win_rate']:>6.1f}% {status:>8} {profitable}")
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("AGGREGATED (PRIMARY PERIODS ONLY):")
-    print("-" * 80)
+    print("-" * 100)
     agg = summary['aggregated']
     print(f"Profitable Periods:    {agg['primary_periods_profitable']}/4")
-    print(f"Average Return:        {agg['average_return']:+.2f}%")
+    print(f"Average Return:        {agg['average_return']:+.2f}% (with stop-loss)")
+    print(f"Avg Return (no SL):    {agg.get('average_return_no_sl', agg['average_return']):+.2f}%")
     print(f"Average Sharpe:        {agg['average_sharpe']:.2f}")
     print(f"Worst Period:          {agg['worst_period_return']:+.2f}%")
     print(f"Best Period:           {agg['best_period_return']:+.2f}%")
     print(f"Total Trades:          {agg['total_trades_all_periods']}")
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("VERDICT:")
-    print("-" * 80)
+    print("-" * 100)
     v = summary['verdict']
     print(f"Grade:          {v['grade']}")
     print(f"Passed:         {'YES' if v['passed'] else 'NO'}")
     print(f"Reasoning:      {v['reasoning']}")
     print(f"Recommendation: {v['recommendation']}")
-    print("=" * 80 + "\n")
+    print("=" * 100 + "\n")
 
 
 # =============================================================================
