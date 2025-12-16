@@ -38,13 +38,15 @@ def analyze_thresholds(df: pd.DataFrame):
 
     # Test different threshold combinations
     configs = [
-        (0.015, 0.005, "Current (strict)"),
-        (0.012, 0.006, "Moderate A"),
-        (0.012, 0.008, "Moderate B"),
-        (0.010, 0.008, "Relaxed A"),
-        (0.010, 0.010, "Relaxed B"),
-        (0.008, 0.010, "Relaxed C"),
-        (0.008, 0.012, "Aggressive"),
+        (0.015, 0.005, "Strict"),
+        (0.012, 0.008, "Moderate"),
+        (0.010, 0.010, "Relaxed A"),
+        (0.008, 0.012, "Relaxed B"),
+        (0.006, 0.012, "Aggressive A"),
+        (0.006, 0.015, "Aggressive B"),
+        (0.005, 0.015, "Very Aggressive A"),
+        (0.005, 0.020, "Very Aggressive B"),
+        (0.004, 0.020, "Ultra Aggressive"),
     ]
 
     print(f"\n{'Config':<20} {'Move%':<8} {'MAE%':<8} {'HIGH_BULL':<12} {'LOW_BEAR':<12} {'Total%':<10}")
