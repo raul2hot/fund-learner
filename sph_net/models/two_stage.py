@@ -235,6 +235,132 @@ class TwoStageModel(nn.Module):
         }
 
 
+class CalibratedTwoStageModel(nn.Module):
+    """
+    Wrapper for TwoStageModel with calibrated thresholds and position sizing.
+
+    This class wraps a trained TwoStageModel and adds:
+    1. Calibrated trade threshold (reduces over-trading)
+    2. Confidence-based position sizing
+    3. Regime filtering (optional)
+
+    Usage:
+        calibrated = CalibratedTwoStageModel(model, trade_threshold=0.65)
+        results = calibrated.predict_with_sizing(prices, features)
+    """
+
+    def __init__(
+        self,
+        model: 'TwoStageModel',
+        trade_threshold: float = 0.65,
+        direction_threshold: float = 0.5,
+        max_position: float = 1.0,
+        use_position_sizing: bool = True
+    ):
+        super().__init__()
+        self.model = model
+        self.trade_threshold = trade_threshold
+        self.direction_threshold = direction_threshold
+        self.max_position = max_position
+        self.use_position_sizing = use_position_sizing
+
+    def forward(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
+        """Pass through to underlying model."""
+        return self.model(prices, features)
+
+    @torch.no_grad()
+    def predict_with_sizing(
+        self,
+        prices: torch.Tensor,
+        features: torch.Tensor
+    ) -> dict:
+        """
+        Get predictions with calibrated thresholds and position sizing.
+
+        Returns:
+            dict with:
+            - should_trade: [batch] bool - whether to trade
+            - direction: [batch] 'long'/'short'/None
+            - position_size: [batch] 0.0-1.0 position size
+            - trade_prob: [batch] probability of trade
+            - direction_confidence: [batch] confidence in direction
+        """
+        outputs = self.model(prices, features)
+
+        # Get probabilities
+        tradeable_probs = F.softmax(outputs['tradeable_logits'], dim=-1)
+        direction_probs = F.softmax(outputs['direction_logits'], dim=-1)
+
+        trade_prob = tradeable_probs[:, 1]  # P(trade)
+        long_prob = direction_probs[:, 0]   # P(long)
+        short_prob = direction_probs[:, 1]  # P(short)
+
+        # Apply calibrated threshold
+        should_trade = trade_prob >= self.trade_threshold
+
+        # Determine direction
+        is_long = long_prob > short_prob
+        direction_confidence = torch.abs(long_prob - 0.5) * 2  # 0-1 scale
+
+        # Calculate position size if enabled
+        if self.use_position_sizing:
+            # Scale trade_prob from [threshold, 1] to [0, 1]
+            scaled_prob = (trade_prob - self.trade_threshold) / (1.0 - self.trade_threshold)
+            scaled_prob = scaled_prob.clamp(0, 1)
+
+            # Combine with direction confidence
+            position_size = scaled_prob * (0.7 + 0.3 * direction_confidence)
+            position_size = position_size.clamp(0, self.max_position)
+
+            # Zero position for non-trades
+            position_size = torch.where(should_trade, position_size, torch.zeros_like(position_size))
+        else:
+            position_size = torch.where(should_trade, torch.ones_like(trade_prob), torch.zeros_like(trade_prob))
+
+        return {
+            'should_trade': should_trade,
+            'is_long': is_long,
+            'position_size': position_size,
+            'trade_prob': trade_prob,
+            'direction_confidence': direction_confidence,
+            'long_prob': long_prob,
+            'short_prob': short_prob,
+        }
+
+    def get_trade_signal(
+        self,
+        prices: torch.Tensor,
+        features: torch.Tensor
+    ) -> dict:
+        """
+        Get a single trade signal (convenience method for single samples).
+
+        Returns:
+            dict with human-readable trade signal
+        """
+        results = self.predict_with_sizing(prices, features)
+
+        signals = []
+        for i in range(len(results['should_trade'])):
+            if results['should_trade'][i]:
+                direction = 'LONG' if results['is_long'][i] else 'SHORT'
+                signals.append({
+                    'action': direction,
+                    'position_size': results['position_size'][i].item(),
+                    'confidence': results['trade_prob'][i].item(),
+                    'direction_confidence': results['direction_confidence'][i].item(),
+                })
+            else:
+                signals.append({
+                    'action': 'HOLD',
+                    'position_size': 0.0,
+                    'confidence': results['trade_prob'][i].item(),
+                    'direction_confidence': 0.0,
+                })
+
+        return signals if len(signals) > 1 else signals[0]
+
+
 class TwoStageLoss(nn.Module):
     """
     Loss function for Two-Stage Model.
