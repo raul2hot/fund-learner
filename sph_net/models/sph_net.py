@@ -1,31 +1,40 @@
-"""SPH-Net: Hybrid Transformer for Financial Time Series"""
+"""
+SPH-Net: Hybrid Transformer for Trading Classification
+
+Updated for 5-class classification with auxiliary regression.
+"""
 
 import torch
 import torch.nn as nn
 
 from .encoders import TemporalEncoder, FeatureEncoder
 from .attention import CoAttentionFusion
-from .heads import RegressionHead, ClassificationHead, UncertaintyHead
+from .heads import ClassificationHead, AuxiliaryRegressionHead
 
 
 class SPHNet(nn.Module):
     """
-    SPH-Net Hybrid Transformer
+    SPH-Net for 5-Class Trading Classification.
 
     Architecture:
-    1. Temporal Encoder (Transformer) for price/returns
-    2. Feature Encoder (MLP) for engineered features
-    3. Co-Attention Fusion
-    4. Prediction Heads (regression, classification, uncertainty)
+    1. Temporal Encoder (Transformer) - processes OHLCV
+    2. Feature Encoder (MLP) - processes engineered features
+    3. Co-Attention Fusion - combines both streams
+    4. Classification Head - 5-class output
+    5. Auxiliary Regression Head - return prediction (optional)
     """
 
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        # Support both old and new config attribute names
+        n_price_features = getattr(config, 'n_price_features', getattr(config, 'price_features', 5))
+        n_engineered_features = getattr(config, 'n_engineered_features', getattr(config, 'engineered_features', 10))
+
         # Encoders
         self.temporal_encoder = TemporalEncoder(
-            input_dim=config.price_features,
+            input_dim=n_price_features,
             d_model=config.d_model,
             n_heads=config.n_heads,
             n_layers=config.n_encoder_layers,
@@ -33,7 +42,7 @@ class SPHNet(nn.Module):
         )
 
         self.feature_encoder = FeatureEncoder(
-            input_dim=config.engineered_features,
+            input_dim=n_engineered_features,
             d_model=config.d_model,
             dropout=config.dropout
         )
@@ -45,56 +54,76 @@ class SPHNet(nn.Module):
             dropout=config.dropout
         )
 
-        # Optional: Additional transformer block after fusion
+        # Post-fusion transformer layer
+        d_feedforward = getattr(config, 'd_feedforward', config.d_model * 4)
         self.decoder = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.n_heads,
-            dim_feedforward=config.d_model * 4,
+            dim_feedforward=d_feedforward,
             dropout=config.dropout,
             activation='gelu',
             batch_first=True
         )
 
-        # Prediction heads
-        self.regression_head = RegressionHead(
-            config.d_model, config.forecast_horizon, config.dropout
-        )
-        self.classification_head = ClassificationHead(
-            config.d_model, config.forecast_horizon, config.dropout
-        )
-        self.uncertainty_head = UncertaintyHead(
-            config.d_model, config.forecast_horizon, config.dropout
+        # Pooling: use last token
+        self.pool = nn.Identity()
+
+        # Heads
+        n_classes = getattr(config, 'n_classes', 5)
+        self.classifier = ClassificationHead(
+            config.d_model,
+            n_classes=n_classes,
+            dropout=config.dropout
         )
 
-    def forward(self, prices, features):
+        self.aux_regressor = AuxiliaryRegressionHead(
+            config.d_model,
+            dropout=config.dropout
+        )
+
+    def forward(
+        self,
+        prices: torch.Tensor,
+        features: torch.Tensor
+    ) -> dict:
         """
         Args:
-            prices: [batch, T, P_price] - OHLCV or returns
-            features: [batch, T, P_feat] - Engineered features
+            prices: [batch, window_size, n_price_features]
+            features: [batch, window_size, n_engineered_features]
 
         Returns:
-            dict with 'return_pred', 'direction_pred', 'uncertainty'
+            dict with:
+            - logits: [batch, n_classes]
+            - return_pred: [batch]
         """
         # Encode
-        temporal_tokens = self.temporal_encoder(prices)      # [batch, T, d_model]
-        feature_tokens = self.feature_encoder(features)      # [batch, T, d_model]
+        temporal_tokens = self.temporal_encoder(prices)
+        feature_tokens = self.feature_encoder(features)
 
-        # Fuse with co-attention
-        fused = self.co_attention(temporal_tokens, feature_tokens)  # [batch, T, d_model]
+        # Fuse
+        fused = self.co_attention(temporal_tokens, feature_tokens)
 
         # Decode
-        decoded = self.decoder(fused)  # [batch, T, d_model]
+        decoded = self.decoder(fused)
 
-        # Use last token for prediction
-        last_token = decoded[:, -1, :]  # [batch, d_model]
+        # Pool: use last token
+        pooled = decoded[:, -1, :]
 
         # Predictions
-        return_pred = self.regression_head(last_token)
-        direction_pred = self.classification_head(last_token)
-        uncertainty = self.uncertainty_head(last_token)
+        logits = self.classifier(pooled)
+        return_pred = self.aux_regressor(pooled)
 
         return {
-            'return_pred': return_pred,
-            'direction_pred': direction_pred,
-            'uncertainty': uncertainty
+            'logits': logits,
+            'return_pred': return_pred
         }
+
+    def predict(self, prices: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """Get class predictions."""
+        outputs = self.forward(prices, features)
+        return torch.argmax(outputs['logits'], dim=-1)
+
+    def predict_proba(self, prices: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """Get class probabilities."""
+        outputs = self.forward(prices, features)
+        return torch.softmax(outputs['logits'], dim=-1)
