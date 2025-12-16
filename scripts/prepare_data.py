@@ -99,10 +99,13 @@ def main():
     logger.info("STEP 1: Labeling")
     logger.info("="*50)
 
+    # Labeling thresholds - adjust these based on your data:
+    # Run: python scripts/analyze_thresholds.py to find optimal values
+    # Target: 8-12% tradeable samples (HIGH_BULL + LOW_BEAR)
     label_config = LabelingConfig(
-        strong_move_threshold=0.015,
-        weak_move_threshold=0.005,
-        clean_path_mae_threshold=0.005
+        strong_move_threshold=0.010,    # 1.0% - more tradeable signals
+        weak_move_threshold=0.004,      # 0.4% - tighter range filter
+        clean_path_mae_threshold=0.010  # 1.0% - better survival rate
     )
     labeler = CandleLabeler(label_config)
 
