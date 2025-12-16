@@ -15,6 +15,26 @@ import logging
 import json
 
 from labeling.candle_classifier import CandleLabeler, LabelingConfig
+
+
+def convert_to_serializable(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    else:
+        return obj
+
+
 from labeling.label_analyzer import LabelAnalyzer
 from features.feature_pipeline import FeaturePipeline
 from data.data_splitter import TemporalSplitter, SplitConfig
@@ -179,7 +199,7 @@ def main():
 
     # Save normalization stats
     with open(OUTPUT_DIR / "normalization_stats.json", 'w') as f:
-        json.dump(norm_stats, f, indent=2)
+        json.dump(convert_to_serializable(norm_stats), f, indent=2)
 
     # Save feature columns
     feature_info = {
@@ -188,11 +208,11 @@ def main():
         'all_columns': list(train_normalized.columns)
     }
     with open(OUTPUT_DIR / "feature_info.json", 'w') as f:
-        json.dump(feature_info, f, indent=2)
+        json.dump(convert_to_serializable(feature_info), f, indent=2)
 
     # Save label statistics
     with open(OUTPUT_DIR / "label_stats.json", 'w') as f:
-        json.dump(stats, f, indent=2)
+        json.dump(convert_to_serializable(stats), f, indent=2)
 
     logger.info(f"\nSaved prepared data to {OUTPUT_DIR}/")
     logger.info("Files created:")
