@@ -2,6 +2,7 @@
 Training Loop for SPH-Net
 
 Handles training, validation, early stopping, and checkpointing.
+Supports both standard 5-class model and two-stage model.
 """
 
 import torch
@@ -32,6 +33,7 @@ class Trainer:
     - Learning rate scheduling
     - Gradient clipping
     - Detailed logging
+    - Support for two-stage model
     """
 
     def __init__(
@@ -49,18 +51,38 @@ class Trainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Determine model type
+        self.is_two_stage = getattr(config, 'model_type', 'standard') == 'two_stage'
+
         # Device
         self.device = torch.device(
             config.device if torch.cuda.is_available() else "cpu"
         )
         self.model = self.model.to(self.device)
 
-        # Loss function
-        class_weights = torch.tensor(config.class_weights, dtype=torch.float32)
-        self.criterion = TradingLoss(
-            class_weights=class_weights,
-            focal_gamma=config.focal_gamma
-        )
+        # Loss function based on model type
+        if self.is_two_stage:
+            from sph_net.models.two_stage import TwoStageLoss
+            self.criterion = TwoStageLoss(
+                tradeable_pos_weight=getattr(config, 'tradeable_pos_weight', 7.0),
+                focal_gamma=config.focal_gamma
+            )
+            logger.info("Using Two-Stage Loss")
+        else:
+            class_weights = torch.tensor(config.class_weights, dtype=torch.float32)
+            use_trading_aware = getattr(config, 'use_trading_aware_loss', False)
+            self.criterion = TradingLoss(
+                class_weights=class_weights,
+                focal_gamma=config.focal_gamma,
+                use_trading_aware=use_trading_aware,
+                fn_penalty=getattr(config, 'fn_penalty', 3.0),
+                fp_penalty=getattr(config, 'fp_penalty', 1.5),
+                direction_penalty=getattr(config, 'direction_penalty', 2.0)
+            )
+            if use_trading_aware:
+                logger.info("Using Trading-Aware Loss")
+            else:
+                logger.info("Using Standard Focal Loss")
 
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -88,6 +110,12 @@ class Trainer:
             'val_tradeable_accuracy': [],
             'learning_rate': []
         }
+
+        # Two-stage specific metrics
+        if self.is_two_stage:
+            self.history['val_tradeable_precision'] = []
+            self.history['val_tradeable_recall'] = []
+            self.history['val_direction_accuracy'] = []
 
     def train_epoch(self) -> Dict:
         """Run one training epoch."""
