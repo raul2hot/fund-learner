@@ -6,12 +6,19 @@ Uses the CalibratedTwoStageModel wrapper with optimal settings:
 - Threshold: 0.55 (best Sharpe ratio)
 - No position sizing (equal sizing works better)
 - High volatility filtering enabled
-- Stop-loss: -1.78% (moderate, recommended)
+- Stop-loss: -2.0% (limits tail risk)
+- Take-profit: None (let winners run - positive skew in returns)
 
 Risk Management:
-- Conservative stop-loss (-1.32%): +65.05% return, stops 5% of trades
-- Moderate stop-loss (-1.78%): +52.45% return, stops 2.5% of trades (DEFAULT)
-- Aggressive stop-loss (-2.27%): +44.78% return, stops 1% of trades
+- Conservative stop-loss (-1.32%): stops 5% of trades
+- Moderate stop-loss (-1.78%): stops 2.5% of trades
+- Aggressive stop-loss (-2.00%): stops fewer trades (DEFAULT)
+- Very Loose stop-loss (-2.27%): stops 1% of trades
+
+Take-Profit Strategy:
+- Recommended: None (let winners run)
+- The return distribution has positive skew (more big wins than big losses)
+- Capping winners with take-profit reduces overall returns
 """
 
 import sys
@@ -40,8 +47,8 @@ def load_calibrated_model(
     model_path: Path,
     trade_threshold: float = 0.55,
     filter_high_volatility: bool = True,
-    stop_loss_pct: float = -0.0178,  # -1.78% moderate stop-loss (recommended)
-    take_profit_pct: float = None,   # None = let winners run
+    stop_loss_pct: float = -0.02,  # -2.0% stop-loss
+    take_profit_pct: float = None,   # None = let winners run (positive skew)
 ) -> CalibratedTwoStageModel:
     """Load trained model and wrap with calibration and risk management."""
 
@@ -319,9 +326,10 @@ def main():
     # Risk Management Settings (from tail risk analysis)
     # Stop-loss options:
     #   Conservative: -0.0132 (-1.32%) - stops 5% of trades
-    #   Moderate:     -0.0178 (-1.78%) - stops 2.5% of trades (RECOMMENDED)
-    #   Aggressive:   -0.0227 (-2.27%) - stops 1% of trades
-    STOP_LOSS_PCT = -0.0178  # Moderate stop-loss (recommended)
+    #   Moderate:     -0.0178 (-1.78%) - stops 2.5% of trades
+    #   Aggressive:   -0.0200 (-2.00%) - fewer trades stopped
+    #   Very Loose:   -0.0227 (-2.27%) - stops 1% of trades
+    STOP_LOSS_PCT = -0.02  # -2.0% stop-loss
     TAKE_PROFIT_PCT = None   # Let winners run (positive skew in returns)
 
     # Check paths
