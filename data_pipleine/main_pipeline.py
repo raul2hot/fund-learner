@@ -15,7 +15,7 @@ import logging
 import json
 import os
 
-from data_fetcher import BinanceFetcher, FearGreedFetcher
+from data_fetcher import BinanceFetcher, FearGreedFetcher, CoinGeckoFetcher, DemoDataGenerator
 from data_processor import DataProcessor
 from edge_cases import EdgeCaseHandler, run_all_validations, print_validation_report
 
@@ -43,15 +43,22 @@ class MLDataPipeline:
         self,
         symbol: str = "BTCUSDT",
         binance_api_key: str = None,
-        output_dir: str = "./data"
+        output_dir: str = "./data",
+        use_spot: bool = False,
+        use_coingecko: bool = False,
+        demo_mode: bool = False
     ):
         self.symbol = symbol
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.use_coingecko = use_coingecko
+        self.demo_mode = demo_mode
+
         # Initialize components
         api_key = binance_api_key or os.environ.get('BINANCE_API_KEY')
-        self.binance = BinanceFetcher(api_key=api_key)
+        self.binance = BinanceFetcher(api_key=api_key, use_spot=use_spot)
+        self.coingecko = CoinGeckoFetcher()
+        self.demo = DemoDataGenerator()
         self.fng = FearGreedFetcher()
         self.processor = DataProcessor()
         self.edge_handler = EdgeCaseHandler()
@@ -101,21 +108,67 @@ class MLDataPipeline:
         
         # Step 1: Fetch all data
         logger.info("\n[1/5] Fetching data from sources...")
-        
-        ohlcv_df = self.binance.fetch_klines(
-            symbol=self.symbol,
-            interval="1h",
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        funding_df = self.binance.fetch_funding_rate(
-            symbol=self.symbol,
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        fng_df = self.fng.fetch_all()
+
+        if self.demo_mode:
+            logger.info("Using DEMO MODE with synthetic data")
+            ohlcv_df = self.demo.fetch_klines(
+                symbol=self.symbol,
+                interval="1h",
+                start_date=start_date,
+                end_date=end_date
+            )
+            funding_df = self.demo.fetch_funding_rate(
+                symbol=self.symbol,
+                start_date=start_date,
+                end_date=end_date
+            )
+            # Try to get real Fear & Greed data, fall back to empty if unavailable
+            try:
+                fng_df = self.fng.fetch_all()
+            except Exception:
+                fng_df = pd.DataFrame(columns=['timestamp', 'fear_greed_value', 'fear_greed_class'])
+        elif self.use_coingecko:
+            logger.info("Using CoinGecko API (Binance unavailable)")
+            ohlcv_df = self.coingecko.fetch_klines(
+                symbol=self.symbol,
+                interval="1h",
+                start_date=start_date,
+                end_date=end_date
+            )
+            funding_df = pd.DataFrame(columns=['timestamp', 'funding_rate', 'mark_price'])
+            fng_df = self.fng.fetch_all()
+        else:
+            try:
+                ohlcv_df = self.binance.fetch_klines(
+                    symbol=self.symbol,
+                    interval="1h",
+                    start_date=start_date,
+                    end_date=end_date
+                )
+            except Exception as e:
+                logger.warning(f"Binance API failed: {e}. Falling back to demo mode...")
+                self.demo_mode = True
+                ohlcv_df = self.demo.fetch_klines(
+                    symbol=self.symbol,
+                    interval="1h",
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+            if self.demo_mode:
+                funding_df = self.demo.fetch_funding_rate(
+                    symbol=self.symbol,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+            else:
+                funding_df = self.binance.fetch_funding_rate(
+                    symbol=self.symbol,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+            fng_df = self.fng.fetch_all()
         
         if save_intermediate:
             self._save_intermediate(ohlcv_df, 'ohlcv_raw.parquet')
@@ -225,22 +278,25 @@ class MLDataPipeline:
                           f"NaN={nan_count} ({nan_pct:.2f}%)")
 
 
-def quick_test():
+def quick_test(use_spot: bool = False, use_coingecko: bool = False, demo_mode: bool = False):
     """Quick test with recent data."""
     print("\n" + "=" * 60)
     print("QUICK TEST - Last 7 days of data")
     print("=" * 60)
-    
+
     from datetime import datetime, timedelta
-    
+
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    
+
     pipeline = MLDataPipeline(
         symbol="BTCUSDT",
-        output_dir="./test_data"
+        output_dir="./test_data",
+        use_spot=use_spot,
+        use_coingecko=use_coingecko,
+        demo_mode=demo_mode
     )
-    
+
     df = pipeline.run(start_date=start_date, end_date=end_date)
     
     print(f"\nFinal dataset shape: {df.shape}")
@@ -256,7 +312,7 @@ def quick_test():
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='ML Data Pipeline for Crypto Trading')
     parser.add_argument('--symbol', default='BTCUSDT', help='Trading pair symbol')
     parser.add_argument('--start', required=False, help='Start date (YYYY-MM-DD)')
@@ -264,27 +320,37 @@ if __name__ == "__main__":
     parser.add_argument('--output', default='./ml_data', help='Output directory')
     parser.add_argument('--test', action='store_true', help='Run quick test with last 7 days')
     parser.add_argument('--save-intermediate', action='store_true', help='Save intermediate files')
-    
+    parser.add_argument('--use-spot', action='store_true',
+                       help='Use Spot API instead of Futures (no funding rate data)')
+    parser.add_argument('--use-coingecko', action='store_true',
+                       help='Use CoinGecko API instead of Binance (fallback for geo-blocked regions)')
+    parser.add_argument('--demo', action='store_true',
+                       help='Use synthetic demo data (for testing when APIs are unavailable)')
+
     args = parser.parse_args()
-    
+
     if args.test:
-        quick_test()
+        quick_test(use_spot=args.use_spot, use_coingecko=args.use_coingecko, demo_mode=args.demo)
     elif args.start:
         pipeline = MLDataPipeline(
             symbol=args.symbol,
-            output_dir=args.output
+            output_dir=args.output,
+            use_spot=args.use_spot,
+            use_coingecko=args.use_coingecko,
+            demo_mode=args.demo
         )
-        
+
         df = pipeline.run(
             start_date=args.start,
             end_date=args.end,
             save_intermediate=args.save_intermediate
         )
-        
+
         print(f"\nPipeline completed. Output saved to {args.output}")
         print(f"Final dataset shape: {df.shape}")
     else:
         print("Usage:")
-        print("  Quick test:    python main_pipeline.py --test")
-        print("  Full run:      python main_pipeline.py --start 2023-01-01 --end 2024-12-31")
-        print("  With options:  python main_pipeline.py --start 2023-01-01 --symbol ETHUSDT --output ./eth_data")
+        print("  Quick test:      python main_pipeline.py --test")
+        print("  Demo mode:       python main_pipeline.py --test --demo")
+        print("  Full run:        python main_pipeline.py --start 2023-01-01 --end 2024-12-31")
+        print("  With options:    python main_pipeline.py --start 2023-01-01 --symbol ETHUSDT --output ./eth_data")

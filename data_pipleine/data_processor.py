@@ -41,14 +41,17 @@ class DataProcessor:
     ) -> pd.DataFrame:
         """
         Align 8-hourly funding rate to hourly timestamps.
-        
+
         Strategy: Forward-fill
         - Funding rate at 00:00 applies to hours 00-07
         - Funding rate at 08:00 applies to hours 08-15
         - Funding rate at 16:00 applies to hours 16-23
         """
-        if funding_df.empty:
-            return pd.DataFrame(index=target_index, columns=['funding_rate'])
+        if funding_df.empty or 'timestamp' not in funding_df.columns:
+            # Return DataFrame with timestamp column for compatibility
+            result = pd.DataFrame({'timestamp': target_index, 'funding_rate': np.nan})
+            logger.info("No funding rate data available, using NaN values")
+            return result
         
         funding_indexed = funding_df.set_index('timestamp')
         aligned = funding_indexed[['funding_rate']].reindex(target_index)
@@ -70,12 +73,15 @@ class DataProcessor:
     ) -> pd.DataFrame:
         """
         Align daily Fear & Greed index to hourly timestamps.
-        
+
         Strategy: Forward-fill
         - Daily value at 00:00 UTC applies to all 24 hours of that day
         """
-        if fng_df.empty:
-            return pd.DataFrame(index=target_index, columns=['fear_greed_value'])
+        if fng_df.empty or 'timestamp' not in fng_df.columns:
+            # Return DataFrame with timestamp column for compatibility
+            result = pd.DataFrame({'timestamp': target_index, 'fear_greed_value': np.nan})
+            logger.info("No Fear & Greed data available, using NaN values")
+            return result
         
         fng_indexed = fng_df.set_index('timestamp')
         aligned = fng_indexed[['fear_greed_value']].reindex(target_index)
