@@ -700,7 +700,10 @@ def generate_performance_review(results_df: pd.DataFrame, trading_days: int = 34
 
     for level_name, level in stop_suggestions.items():
         lines.append(f"{level_name.upper()}:")
-        lines.append(f"  Stop Level: {level['stop_loss_pct']:.4f}%")
+        if level['stop_loss_pct'] is not None:
+            lines.append(f"  Stop Level: {level['stop_loss_pct']:.4f}%")
+        else:
+            lines.append(f"  Stop Level: None (baseline)")
         lines.append(f"  Description: {level['description']}")
         if 'new_total_return' in level:
             lines.append(f"  Original Total Return: {level['original_total_return']:.2f}%")

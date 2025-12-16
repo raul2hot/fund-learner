@@ -277,7 +277,7 @@ class CalibratedTwoStageModel(nn.Module):
     VOL_HIGH_THRESHOLD = 0.66  # Above this = high volatility (avoid!)
 
     # Default risk management settings (from analysis)
-    DEFAULT_STOP_LOSS = -0.0178   # -1.78% (moderate, 5th percentile)
+    DEFAULT_STOP_LOSS = -0.02     # -2.0% stop-loss
     DEFAULT_TAKE_PROFIT = None    # Let winners run (positive skew)
 
     def __init__(
