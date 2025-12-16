@@ -54,7 +54,7 @@ def main():
 
     # === Load Model ===
     logger.info("Loading model...")
-    checkpoint = torch.load(MODEL_DIR / "best_model.pt", map_location='cpu')
+    checkpoint = torch.load(MODEL_DIR / "best_model.pt", map_location='cpu', weights_only=False)
     config = checkpoint['config']
 
     model = SPHNet(config)
