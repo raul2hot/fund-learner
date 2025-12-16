@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
 from sph_net.config import SPHNetConfig
-from sph_net.models.two_stage import TwoStageModel, CalibratedTwoStageModel
+from sph_net.models.two_stage import TwoStageModel, CalibratedTwoStageModel, apply_stop_loss_to_returns
 from data.dataset import TradingDataset
 from torch.utils.data import DataLoader
 
@@ -436,7 +436,64 @@ def suggest_stop_loss(trades_df: pd.DataFrame, atr_column: str = None) -> Dict:
     """
     Suggest stop-loss levels based on historical trade data.
 
+    Uses the apply_stop_loss_to_returns function for accurate simulation.
+
     Returns suggested stop-loss levels at various confidence intervals.
+    """
+    if len(trades_df) == 0:
+        return {'error': 'No trades to analyze'}
+
+    returns = trades_df['trade_return'].values
+    mae_values = trades_df['trade_mae'].values if 'trade_mae' in trades_df.columns else None
+
+    # Calculate percentile-based stop levels
+    stop_levels = {
+        'conservative': np.percentile(returns, 5),    # 5th percentile
+        'moderate': np.percentile(returns, 2.5),      # 2.5th percentile
+        'aggressive': np.percentile(returns, 1),      # 1st percentile
+    }
+
+    suggestions = {}
+
+    for level_name, stop_pct in stop_levels.items():
+        # Use the apply_stop_loss_to_returns function for accurate simulation
+        sl_results = apply_stop_loss_to_returns(
+            returns,
+            stop_loss_pct=stop_pct,
+            mae_values=mae_values,
+        )
+
+        suggestions[level_name] = {
+            'stop_loss_pct': stop_pct * 100,
+            'stop_loss_decimal': stop_pct,
+            'trades_stopped': sl_results['pct_stopped'],
+            'description': f'{100 - (5 if level_name == "conservative" else 2.5 if level_name == "moderate" else 1):.1f}% of trades unaffected',
+            'original_total_return': sl_results['original_total_return'],
+            'new_total_return': sl_results['adjusted_total_return'],
+            'improvement': sl_results['improvement'],
+            'trades_remaining': len(returns) - sl_results['n_stopped'],
+            'n_stopped': sl_results['n_stopped'],
+        }
+
+    # Also add a "no stop" baseline for comparison
+    suggestions['none'] = {
+        'stop_loss_pct': None,
+        'description': 'No stop-loss (baseline)',
+        'original_total_return': np.sum(returns) * 100,
+        'new_total_return': np.sum(returns) * 100,
+        'improvement': 0,
+        'trades_remaining': len(returns),
+        'n_stopped': 0,
+    }
+
+    return suggestions
+
+
+def suggest_stop_loss_old(trades_df: pd.DataFrame, atr_column: str = None) -> Dict:
+    """
+    [DEPRECATED] Old stop-loss suggestion function.
+
+    Kept for backwards compatibility. Use suggest_stop_loss instead.
     """
     if len(trades_df) == 0:
         return {'error': 'No trades to analyze'}

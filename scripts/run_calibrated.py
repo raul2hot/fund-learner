@@ -6,6 +6,12 @@ Uses the CalibratedTwoStageModel wrapper with optimal settings:
 - Threshold: 0.55 (best Sharpe ratio)
 - No position sizing (equal sizing works better)
 - High volatility filtering enabled
+- Stop-loss: -1.78% (moderate, recommended)
+
+Risk Management:
+- Conservative stop-loss (-1.32%): +65.05% return, stops 5% of trades
+- Moderate stop-loss (-1.78%): +52.45% return, stops 2.5% of trades (DEFAULT)
+- Aggressive stop-loss (-2.27%): +44.78% return, stops 1% of trades
 """
 
 import sys
@@ -20,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sph_net.config import SPHNetConfig
-from sph_net.models.two_stage import TwoStageModel, CalibratedTwoStageModel
+from sph_net.models.two_stage import TwoStageModel, CalibratedTwoStageModel, apply_stop_loss_to_returns
 from data.dataset import TradingDataset
 
 logging.basicConfig(
@@ -33,9 +39,11 @@ logger = logging.getLogger(__name__)
 def load_calibrated_model(
     model_path: Path,
     trade_threshold: float = 0.55,
-    filter_high_volatility: bool = True
+    filter_high_volatility: bool = True,
+    stop_loss_pct: float = -0.0178,  # -1.78% moderate stop-loss (recommended)
+    take_profit_pct: float = None,   # None = let winners run
 ) -> CalibratedTwoStageModel:
-    """Load trained model and wrap with calibration."""
+    """Load trained model and wrap with calibration and risk management."""
 
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
@@ -44,12 +52,14 @@ def load_calibrated_model(
     model = TwoStageModel(config)
     model.load_state_dict(checkpoint['model_state_dict'])
 
-    # Wrap with calibration
+    # Wrap with calibration and risk management
     calibrated = CalibratedTwoStageModel(
         model,
         trade_threshold=trade_threshold,
         filter_high_volatility=filter_high_volatility,
-        use_position_sizing=False  # Equal sizing works better
+        use_position_sizing=False,  # Equal sizing works better
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
     )
 
     return calibrated, config
@@ -86,24 +96,30 @@ def run_inference(
             # Store results
             for i in range(len(results['should_trade'])):
                 trade_return = 0.0
+                trade_mae = 0.0  # Maximum adverse excursion for this trade
+                is_long = results['is_long'][i].item()
+
                 if results['should_trade'][i]:
-                    if results['is_long'][i]:
+                    if is_long:
                         trade_return = next_return[i].item()
+                        trade_mae = next_mae_long[i].item()  # MAE for long position
                     else:
                         trade_return = -next_return[i].item()
+                        trade_mae = next_mae_short[i].item()  # MAE for short position
 
                 all_results.append({
                     'batch': batch_idx,
                     'sample': i,
                     'true_label': labels[i].item(),
                     'should_trade': results['should_trade'][i].item(),
-                    'is_long': results['is_long'][i].item(),
+                    'is_long': is_long,
                     'trade_prob': results['trade_prob'][i].item(),
                     'direction_confidence': results['direction_confidence'][i].item(),
                     'position_size': results['position_size'][i].item(),
                     'regime_filtered': results['regime_filtered'][i].item(),
                     'next_return': next_return[i].item(),
                     'trade_return': trade_return,
+                    'trade_mae': trade_mae,  # MAE for stop-loss simulation
                     'next_mae_long': next_mae_long[i].item(),
                     'next_mae_short': next_mae_short[i].item(),
                 })
@@ -111,10 +127,14 @@ def run_inference(
     return pd.DataFrame(all_results)
 
 
-def compute_performance(results_df: pd.DataFrame) -> dict:
-    """Compute performance metrics from results."""
+def compute_performance(
+    results_df: pd.DataFrame,
+    stop_loss_pct: float = None,
+    take_profit_pct: float = None,
+) -> dict:
+    """Compute performance metrics from results, with optional stop-loss simulation."""
 
-    trades = results_df[results_df['should_trade']]
+    trades = results_df[results_df['should_trade']].copy()
     filtered = results_df[results_df['regime_filtered']]
 
     metrics = {
@@ -122,51 +142,88 @@ def compute_performance(results_df: pd.DataFrame) -> dict:
         'total_trades': len(trades),
         'trades_filtered_by_regime': len(filtered),
         'trade_frequency': len(trades) / len(results_df) * 100,
+        'stop_loss_pct': stop_loss_pct,
+        'take_profit_pct': take_profit_pct,
     }
 
-    if len(trades) > 0:
-        # Long trades
-        long_trades = trades[trades['is_long']]
-        if len(long_trades) > 0:
-            metrics['long_trades'] = len(long_trades)
-            metrics['long_total_return'] = long_trades['trade_return'].sum() * 100
-            metrics['long_avg_return'] = long_trades['trade_return'].mean() * 100
-            metrics['long_win_rate'] = (long_trades['trade_return'] > 0).mean() * 100
-            metrics['long_correct_class'] = (long_trades['true_label'] == 0).mean() * 100
+    if len(trades) == 0:
+        return metrics
 
-        # Short trades
-        short_trades = trades[~trades['is_long']]
-        if len(short_trades) > 0:
-            metrics['short_trades'] = len(short_trades)
-            metrics['short_total_return'] = short_trades['trade_return'].sum() * 100
-            metrics['short_avg_return'] = short_trades['trade_return'].mean() * 100
-            metrics['short_win_rate'] = (short_trades['trade_return'] > 0).mean() * 100
-            metrics['short_correct_class'] = (short_trades['true_label'] == 4).mean() * 100
+    # Apply stop-loss if configured
+    if stop_loss_pct is not None or take_profit_pct is not None:
+        # Use MAE-based stop-loss simulation if available
+        mae_values = trades['trade_mae'].values if 'trade_mae' in trades.columns else None
 
-        # Combined
-        metrics['total_return'] = trades['trade_return'].sum() * 100
-        metrics['avg_return_per_trade'] = trades['trade_return'].mean() * 100
-        metrics['overall_win_rate'] = (trades['trade_return'] > 0).mean() * 100
+        sl_results = apply_stop_loss_to_returns(
+            trades['trade_return'].values,
+            stop_loss_pct=stop_loss_pct,
+            mae_values=mae_values,
+            take_profit_pct=take_profit_pct,
+        )
 
-        # Sharpe ratio (annualized based on actual trading frequency)
-        # Using sqrt(35000) assumes trading every 15-min candle, which overstates Sharpe
-        # Instead, use actual trades per year for proper annualization
-        if trades['trade_return'].std() > 0:
-            # Estimate trading days from total samples (assuming ~96 candles/day)
-            trading_days = len(results_df) / 96
-            trades_per_year = len(trades) * (365 / max(trading_days, 1))
-            metrics['sharpe_ratio'] = (
-                trades['trade_return'].mean() / trades['trade_return'].std()
-            ) * np.sqrt(trades_per_year)
-            metrics['trades_per_year'] = trades_per_year
+        # Store both original and adjusted returns
+        trades['original_return'] = trades['trade_return']
+        trades['trade_return'] = sl_results['adjusted_returns']
+        trades['stopped_out'] = sl_results['stopped_out']
+        trades['took_profit'] = sl_results['took_profit']
 
-            # Also compute the original (overstated) for comparison
-            metrics['sharpe_ratio_original'] = (
-                trades['trade_return'].mean() / trades['trade_return'].std()
-            ) * np.sqrt(35000)
-        else:
-            metrics['sharpe_ratio'] = 0.0
-            metrics['sharpe_ratio_original'] = 0.0
+        # Stop-loss specific metrics
+        metrics['n_stopped_out'] = sl_results['n_stopped']
+        metrics['n_took_profit'] = sl_results['n_took_profit']
+        metrics['pct_stopped'] = sl_results['pct_stopped']
+        metrics['original_total_return'] = sl_results['original_total_return']
+        metrics['sl_improvement'] = sl_results['improvement']
+
+    # Long trades
+    long_trades = trades[trades['is_long']]
+    if len(long_trades) > 0:
+        metrics['long_trades'] = len(long_trades)
+        metrics['long_total_return'] = long_trades['trade_return'].sum() * 100
+        metrics['long_avg_return'] = long_trades['trade_return'].mean() * 100
+        metrics['long_win_rate'] = (long_trades['trade_return'] > 0).mean() * 100
+        metrics['long_correct_class'] = (long_trades['true_label'] == 0).mean() * 100
+        if 'stopped_out' in trades.columns:
+            metrics['long_stopped'] = long_trades['stopped_out'].sum()
+
+    # Short trades
+    short_trades = trades[~trades['is_long']]
+    if len(short_trades) > 0:
+        metrics['short_trades'] = len(short_trades)
+        metrics['short_total_return'] = short_trades['trade_return'].sum() * 100
+        metrics['short_avg_return'] = short_trades['trade_return'].mean() * 100
+        metrics['short_win_rate'] = (short_trades['trade_return'] > 0).mean() * 100
+        metrics['short_correct_class'] = (short_trades['true_label'] == 4).mean() * 100
+        if 'stopped_out' in trades.columns:
+            metrics['short_stopped'] = short_trades['stopped_out'].sum()
+
+    # Combined
+    metrics['total_return'] = trades['trade_return'].sum() * 100
+    metrics['avg_return_per_trade'] = trades['trade_return'].mean() * 100
+    metrics['overall_win_rate'] = (trades['trade_return'] > 0).mean() * 100
+
+    # Sharpe ratio (annualized based on actual trading frequency)
+    if trades['trade_return'].std() > 0:
+        # Estimate trading days from total samples (assuming ~96 candles/day)
+        trading_days = len(results_df) / 96
+        trades_per_year = len(trades) * (365 / max(trading_days, 1))
+        metrics['sharpe_ratio'] = (
+            trades['trade_return'].mean() / trades['trade_return'].std()
+        ) * np.sqrt(trades_per_year)
+        metrics['trades_per_year'] = trades_per_year
+
+        # Also compute the original (overstated) for comparison
+        metrics['sharpe_ratio_original'] = (
+            trades['trade_return'].mean() / trades['trade_return'].std()
+        ) * np.sqrt(35000)
+    else:
+        metrics['sharpe_ratio'] = 0.0
+        metrics['sharpe_ratio_original'] = 0.0
+
+    # Tail risk metrics
+    metrics['worst_trade'] = trades['trade_return'].min() * 100
+    metrics['best_trade'] = trades['trade_return'].max() * 100
+    metrics['max_drawdown'] = (trades['trade_return'].cumsum().cummax() -
+                               trades['trade_return'].cumsum()).max() * 100
 
     return metrics
 
@@ -185,6 +242,21 @@ def print_report(metrics: dict):
     print(f"Filtered by High Vol:       {metrics['trades_filtered_by_regime']:,}")
     print(f"Trade Frequency:            {metrics['trade_frequency']:.2f}%")
 
+    # Risk Management Settings
+    print(f"\nRISK MANAGEMENT")
+    print("-" * 40)
+    sl_pct = metrics.get('stop_loss_pct')
+    tp_pct = metrics.get('take_profit_pct')
+    print(f"Stop-Loss:                  {sl_pct*100:.2f}%" if sl_pct else "Stop-Loss:                  None")
+    print(f"Take-Profit:                {tp_pct*100:.2f}%" if tp_pct else "Take-Profit:                None (let winners run)")
+
+    if 'n_stopped_out' in metrics:
+        print(f"Trades Stopped Out:         {metrics['n_stopped_out']} ({metrics['pct_stopped']:.1f}%)")
+        if metrics.get('n_took_profit', 0) > 0:
+            print(f"Trades Hit Take-Profit:     {metrics['n_took_profit']}")
+        print(f"Original Total Return:      {metrics['original_total_return']:+.2f}%")
+        print(f"Stop-Loss Improvement:      {metrics['sl_improvement']:+.2f}%")
+
     if metrics['total_trades'] > 0:
         print(f"\nLONG TRADES")
         print("-" * 40)
@@ -194,6 +266,8 @@ def print_report(metrics: dict):
             print(f"Avg Return/Trade:           {metrics['long_avg_return']:+.4f}%")
             print(f"Win Rate:                   {metrics['long_win_rate']:.2f}%")
             print(f"Correct Class (HIGH_BULL):  {metrics['long_correct_class']:.2f}%")
+            if 'long_stopped' in metrics:
+                print(f"Stopped Out:                {metrics['long_stopped']}")
         else:
             print("No long trades")
 
@@ -205,6 +279,8 @@ def print_report(metrics: dict):
             print(f"Avg Return/Trade:           {metrics['short_avg_return']:+.4f}%")
             print(f"Win Rate:                   {metrics['short_win_rate']:.2f}%")
             print(f"Correct Class (LOW_BEAR):   {metrics['short_correct_class']:.2f}%")
+            if 'short_stopped' in metrics:
+                print(f"Stopped Out:                {metrics['short_stopped']}")
         else:
             print("No short trades")
 
@@ -215,7 +291,12 @@ def print_report(metrics: dict):
         print(f"Overall Win Rate:           {metrics['overall_win_rate']:.2f}%")
         print(f"Trades per Year (est.):     {metrics.get('trades_per_year', 'N/A'):.1f}")
         print(f"Sharpe Ratio (corrected):   {metrics['sharpe_ratio']:.2f}")
-        print(f"Sharpe Ratio (original):    {metrics.get('sharpe_ratio_original', 'N/A'):.2f}  ← overstated")
+
+        print(f"\nTAIL RISK")
+        print("-" * 40)
+        print(f"Worst Trade:                {metrics.get('worst_trade', 'N/A'):+.4f}%")
+        print(f"Best Trade:                 {metrics.get('best_trade', 'N/A'):+.4f}%")
+        print(f"Max Drawdown:               {metrics.get('max_drawdown', 'N/A'):.2f}%")
 
     print("\n" + "=" * 70)
 
@@ -231,6 +312,14 @@ def main():
     TRADE_THRESHOLD = 0.55
     FILTER_HIGH_VOL = True
 
+    # Risk Management Settings (from tail risk analysis)
+    # Stop-loss options:
+    #   Conservative: -0.0132 (-1.32%) - stops 5% of trades
+    #   Moderate:     -0.0178 (-1.78%) - stops 2.5% of trades (RECOMMENDED)
+    #   Aggressive:   -0.0227 (-2.27%) - stops 1% of trades
+    STOP_LOSS_PCT = -0.0178  # Moderate stop-loss (recommended)
+    TAKE_PROFIT_PCT = None   # Let winners run (positive skew in returns)
+
     # Check paths
     if not (MODEL_DIR / "best_model.pt").exists():
         logger.error(f"Model not found at {MODEL_DIR / 'best_model.pt'}")
@@ -241,11 +330,13 @@ def main():
         return
 
     # === Load Model ===
-    logger.info(f"Loading calibrated model (threshold={TRADE_THRESHOLD})...")
+    logger.info(f"Loading calibrated model (threshold={TRADE_THRESHOLD}, stop_loss={STOP_LOSS_PCT*100:.2f}%)...")
     calibrated_model, config = load_calibrated_model(
         MODEL_DIR / "best_model.pt",
         trade_threshold=TRADE_THRESHOLD,
-        filter_high_volatility=FILTER_HIGH_VOL
+        filter_high_volatility=FILTER_HIGH_VOL,
+        stop_loss_pct=STOP_LOSS_PCT,
+        take_profit_pct=TAKE_PROFIT_PCT,
     )
 
     # === Load Test Data ===
@@ -274,11 +365,34 @@ def main():
     logger.info("Running calibrated inference...")
     results_df = run_inference(calibrated_model, test_loader, device=config.device)
 
-    # === Compute Metrics ===
-    metrics = compute_performance(results_df)
+    # === Compute Metrics (with stop-loss) ===
+    metrics = compute_performance(
+        results_df,
+        stop_loss_pct=STOP_LOSS_PCT,
+        take_profit_pct=TAKE_PROFIT_PCT,
+    )
 
     # === Print Report ===
     print_report(metrics)
+
+    # === Compare with and without stop-loss ===
+    print("\n" + "=" * 70)
+    print("STOP-LOSS COMPARISON")
+    print("=" * 70)
+
+    # Without stop-loss
+    metrics_no_sl = compute_performance(results_df, stop_loss_pct=None)
+    print(f"\nWithout Stop-Loss:")
+    print(f"  Total Return:    {metrics_no_sl['total_return']:+.2f}%")
+    print(f"  Sharpe Ratio:    {metrics_no_sl['sharpe_ratio']:.2f}")
+    print(f"  Worst Trade:     {metrics_no_sl.get('worst_trade', 'N/A'):+.4f}%")
+
+    print(f"\nWith {STOP_LOSS_PCT*100:.2f}% Stop-Loss:")
+    print(f"  Total Return:    {metrics['total_return']:+.2f}%")
+    print(f"  Sharpe Ratio:    {metrics['sharpe_ratio']:.2f}")
+    print(f"  Worst Trade:     {metrics.get('worst_trade', 'N/A'):+.4f}%")
+    print(f"  Improvement:     {metrics.get('sl_improvement', 0):+.2f}%")
+    print("=" * 70)
 
     # === Save Results ===
     results_df.to_csv(OUTPUT_DIR / "calibrated_predictions.csv", index=False)

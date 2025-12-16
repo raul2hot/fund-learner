@@ -237,19 +237,26 @@ class TwoStageModel(nn.Module):
 
 class CalibratedTwoStageModel(nn.Module):
     """
-    Wrapper for TwoStageModel with calibrated thresholds and regime filtering.
+    Wrapper for TwoStageModel with calibrated thresholds, regime filtering, and risk management.
 
     This class wraps a trained TwoStageModel and adds:
     1. Calibrated trade threshold (reduces over-trading)
     2. Volatility regime filtering (avoid high volatility)
     3. Optional confidence-based position sizing
+    4. Stop-loss and take-profit risk management
 
     Optimal settings based on backtesting (2025 data, 343 days):
     - trade_threshold=0.55: Best risk-adjusted returns
     - ~320 trades, ~3.9% trade frequency
-    - +32.69% total return, +0.10% per trade
+    - +32.69% total return without stop-loss
+    - +52.45% total return with -1.78% stop-loss (moderate)
     - Avoid high volatility regime: loses money (-0.015% avg)
     - Position sizing disabled: confidence doesn't correlate with returns
+
+    Stop-Loss Analysis Results:
+    - Conservative (-1.32%): +65.05% return, stops 5% of trades
+    - Moderate (-1.78%): +52.45% return, stops 2.5% of trades (RECOMMENDED)
+    - Aggressive (-2.27%): +44.78% return, stops 1% of trades
 
     Note on Sharpe Ratio:
     - Use trade-frequency annualization, not candle-frequency
@@ -257,13 +264,21 @@ class CalibratedTwoStageModel(nn.Module):
     - Sharpe = (mean/std) * sqrt(340), NOT sqrt(35000)
 
     Usage:
-        calibrated = CalibratedTwoStageModel(model, trade_threshold=0.55)
+        calibrated = CalibratedTwoStageModel(
+            model,
+            trade_threshold=0.55,
+            stop_loss_pct=-0.0178  # -1.78% stop-loss
+        )
         results = calibrated.predict_with_sizing(prices, features)
     """
 
     # Volatility regime thresholds (percentiles from training data)
     VOL_LOW_THRESHOLD = 0.33   # Below this = low volatility
     VOL_HIGH_THRESHOLD = 0.66  # Above this = high volatility (avoid!)
+
+    # Default risk management settings (from analysis)
+    DEFAULT_STOP_LOSS = -0.0178   # -1.78% (moderate, 5th percentile)
+    DEFAULT_TAKE_PROFIT = None    # Let winners run (positive skew)
 
     def __init__(
         self,
@@ -273,7 +288,9 @@ class CalibratedTwoStageModel(nn.Module):
         max_position: float = 1.0,
         use_position_sizing: bool = False,  # Disabled - doesn't improve returns
         filter_high_volatility: bool = True,  # Avoid high vol regime
-        vol_threshold: float = None  # Custom high vol threshold (auto if None)
+        vol_threshold: float = None,  # Custom high vol threshold (auto if None)
+        stop_loss_pct: float = None,  # Stop-loss as decimal (e.g., -0.0178 for -1.78%)
+        take_profit_pct: float = None,  # Take-profit as decimal (None = let winners run)
     ):
         super().__init__()
         self.model = model
@@ -283,6 +300,8 @@ class CalibratedTwoStageModel(nn.Module):
         self.use_position_sizing = use_position_sizing
         self.filter_high_volatility = filter_high_volatility
         self.vol_threshold = vol_threshold
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
 
     def forward(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
         """Pass through to underlying model."""
@@ -415,6 +434,177 @@ class CalibratedTwoStageModel(nn.Module):
                 })
 
         return signals if len(signals) > 1 else signals[0]
+
+    def apply_stop_loss(
+        self,
+        trade_returns: torch.Tensor,
+        mae_values: torch.Tensor = None,
+    ) -> dict:
+        """
+        Apply stop-loss and take-profit to trade returns.
+
+        In backtesting, we use the Maximum Adverse Excursion (MAE) to determine
+        if a stop-loss would have been triggered. MAE represents the worst
+        drawdown during the trade before it closed.
+
+        Args:
+            trade_returns: [batch] actual trade returns (signed based on direction)
+            mae_values: [batch] maximum adverse excursion during the trade
+                       (how far price moved against the position before close)
+
+        Returns:
+            dict with:
+            - adjusted_returns: [batch] returns after stop-loss application
+            - stopped_out: [batch] bool - True if stop-loss was triggered
+            - took_profit: [batch] bool - True if take-profit was triggered
+        """
+        if self.stop_loss_pct is None and self.take_profit_pct is None:
+            # No risk management, return original returns
+            return {
+                'adjusted_returns': trade_returns,
+                'stopped_out': torch.zeros_like(trade_returns, dtype=torch.bool),
+                'took_profit': torch.zeros_like(trade_returns, dtype=torch.bool),
+            }
+
+        adjusted_returns = trade_returns.clone()
+        stopped_out = torch.zeros_like(trade_returns, dtype=torch.bool)
+        took_profit = torch.zeros_like(trade_returns, dtype=torch.bool)
+
+        # Apply stop-loss
+        if self.stop_loss_pct is not None:
+            # If MAE is provided, use it to determine if stop would have triggered
+            if mae_values is not None:
+                # Stop triggered if MAE exceeded stop-loss threshold
+                stop_triggered = mae_values > abs(self.stop_loss_pct)
+                stopped_out = stop_triggered
+
+                # For stopped trades, cap the loss at stop-loss level
+                # (in reality, slippage might make it slightly worse)
+                adjusted_returns = torch.where(
+                    stop_triggered,
+                    torch.full_like(trade_returns, self.stop_loss_pct),
+                    trade_returns
+                )
+            else:
+                # Without MAE, use simple return-based stop
+                # (less accurate - assumes stop triggers at worst point)
+                stop_triggered = trade_returns < self.stop_loss_pct
+                stopped_out = stop_triggered
+                adjusted_returns = torch.where(
+                    stop_triggered,
+                    torch.full_like(trade_returns, self.stop_loss_pct),
+                    trade_returns
+                )
+
+        # Apply take-profit (after stop-loss)
+        if self.take_profit_pct is not None:
+            # Take profit if return exceeded target
+            tp_triggered = adjusted_returns > self.take_profit_pct
+            took_profit = tp_triggered
+            adjusted_returns = torch.where(
+                tp_triggered,
+                torch.full_like(adjusted_returns, self.take_profit_pct),
+                adjusted_returns
+            )
+
+        return {
+            'adjusted_returns': adjusted_returns,
+            'stopped_out': stopped_out,
+            'took_profit': took_profit,
+        }
+
+    def get_risk_parameters(self) -> dict:
+        """
+        Get current risk management parameters.
+
+        Returns human-readable risk configuration.
+        """
+        return {
+            'stop_loss_pct': self.stop_loss_pct,
+            'stop_loss_display': f"{self.stop_loss_pct * 100:.2f}%" if self.stop_loss_pct else "None",
+            'take_profit_pct': self.take_profit_pct,
+            'take_profit_display': f"{self.take_profit_pct * 100:.2f}%" if self.take_profit_pct else "None (let winners run)",
+            'max_position': self.max_position,
+            'trade_threshold': self.trade_threshold,
+        }
+
+
+def apply_stop_loss_to_returns(
+    trade_returns: torch.Tensor,
+    stop_loss_pct: float,
+    mae_values: torch.Tensor = None,
+    take_profit_pct: float = None,
+) -> dict:
+    """
+    Standalone function to apply stop-loss to trade returns.
+
+    Useful for backtesting different stop-loss levels without
+    instantiating a new model.
+
+    Args:
+        trade_returns: Trade returns (can be numpy array or tensor)
+        stop_loss_pct: Stop-loss as decimal (e.g., -0.0178 for -1.78%)
+        mae_values: Optional MAE values for more accurate simulation
+        take_profit_pct: Optional take-profit level
+
+    Returns:
+        dict with adjusted returns and statistics
+    """
+    import numpy as np
+
+    # Convert to numpy if tensor
+    if isinstance(trade_returns, torch.Tensor):
+        returns = trade_returns.numpy()
+    else:
+        returns = np.array(trade_returns)
+
+    if mae_values is not None:
+        if isinstance(mae_values, torch.Tensor):
+            mae = mae_values.numpy()
+        else:
+            mae = np.array(mae_values)
+    else:
+        mae = None
+
+    adjusted = returns.copy()
+    stopped_out = np.zeros(len(returns), dtype=bool)
+    took_profit = np.zeros(len(returns), dtype=bool)
+
+    # Apply stop-loss
+    if stop_loss_pct is not None:
+        if mae is not None:
+            # Use MAE for accurate stop detection
+            stop_triggered = mae > abs(stop_loss_pct)
+        else:
+            # Fallback: use return-based detection
+            stop_triggered = returns < stop_loss_pct
+
+        stopped_out = stop_triggered
+        adjusted[stop_triggered] = stop_loss_pct
+
+    # Apply take-profit
+    if take_profit_pct is not None:
+        tp_triggered = adjusted > take_profit_pct
+        took_profit = tp_triggered
+        adjusted[tp_triggered] = take_profit_pct
+
+    # Calculate statistics
+    original_total = returns.sum()
+    adjusted_total = adjusted.sum()
+    n_stopped = stopped_out.sum()
+    n_took_profit = took_profit.sum()
+
+    return {
+        'adjusted_returns': adjusted,
+        'stopped_out': stopped_out,
+        'took_profit': took_profit,
+        'original_total_return': original_total * 100,
+        'adjusted_total_return': adjusted_total * 100,
+        'improvement': (adjusted_total - original_total) * 100,
+        'n_stopped': int(n_stopped),
+        'n_took_profit': int(n_took_profit),
+        'pct_stopped': n_stopped / len(returns) * 100 if len(returns) > 0 else 0,
+    }
 
 
 class TwoStageLoss(nn.Module):
