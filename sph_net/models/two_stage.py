@@ -237,16 +237,22 @@ class TwoStageModel(nn.Module):
 
 class CalibratedTwoStageModel(nn.Module):
     """
-    Wrapper for TwoStageModel with calibrated thresholds, regime filtering, and risk management.
+    Wrapper for TwoStageModel with ADAPTIVE thresholds and risk management.
 
     This class wraps a trained TwoStageModel and adds:
     1. Calibrated trade threshold (reduces over-trading)
-    2. Volatility regime filtering (avoid high volatility)
-    3. Optional confidence-based position sizing
-    4. Stop-loss and take-profit risk management
+    2. ADAPTIVE threshold based on regime features (NEW)
+    3. Volatility regime filtering (avoid high volatility)
+    4. Optional confidence-based position sizing
+    5. Stop-loss and take-profit risk management
+
+    NEW: Dynamic threshold based on regime features:
+    - When trend_efficiency is low (choppy market), threshold increases
+    - When vol_ratio is high (elevated uncertainty), threshold increases
+    - This helps avoid over-trading in uncertain conditions like May 2021
 
     Optimal settings based on backtesting (2025 data, 343 days):
-    - trade_threshold=0.55: Best risk-adjusted returns
+    - trade_threshold=0.55: Best risk-adjusted returns (base threshold)
     - ~320 trades, ~3.9% trade frequency
     - +32.69% total return without stop-loss
     - +52.45% total return with -1.78% stop-loss (moderate)
@@ -267,7 +273,10 @@ class CalibratedTwoStageModel(nn.Module):
         calibrated = CalibratedTwoStageModel(
             model,
             trade_threshold=0.55,
-            stop_loss_pct=-0.0178  # -1.78% stop-loss
+            stop_loss_pct=-0.0178,  # -1.78% stop-loss
+            use_adaptive_threshold=True,  # Enable adaptive threshold
+            trend_efficiency_col_idx=42,  # Index of trend_efficiency in features
+            vol_ratio_col_idx=41,         # Index of vol_ratio in features
         )
         results = calibrated.predict_with_sizing(prices, features)
     """
@@ -280,10 +289,22 @@ class CalibratedTwoStageModel(nn.Module):
     DEFAULT_STOP_LOSS = -0.02     # -2.0% stop-loss
     DEFAULT_TAKE_PROFIT = None    # Let winners run (positive skew)
 
+    # Regime detection thresholds for adaptive threshold
+    TREND_EFFICIENCY_LOW = 0.3      # Below this = choppy market
+    TREND_EFFICIENCY_MED = 0.5      # Below this = somewhat choppy
+    VOL_RATIO_HIGH = 1.3            # Above this = elevated volatility
+
+    # Threshold adjustments
+    BASE_THRESHOLD = 0.55
+    CHOPPY_ADJUSTMENT = 0.05        # Add this when choppy
+    VERY_CHOPPY_ADJUSTMENT = 0.10   # Add this when very choppy
+    HIGH_VOL_ADJUSTMENT = 0.05      # Add this when high vol ratio
+    MAX_THRESHOLD = 0.70            # Never go above this
+
     def __init__(
         self,
         model: 'TwoStageModel',
-        trade_threshold: float = 0.55,  # Optimal from analysis
+        trade_threshold: float = 0.55,  # Base threshold (may be adjusted dynamically)
         direction_threshold: float = 0.5,
         max_position: float = 1.0,
         use_position_sizing: bool = False,  # Disabled - doesn't improve returns
@@ -291,9 +312,14 @@ class CalibratedTwoStageModel(nn.Module):
         vol_threshold: float = None,  # Custom high vol threshold (auto if None)
         stop_loss_pct: float = None,  # Stop-loss as decimal (e.g., -0.0178 for -1.78%)
         take_profit_pct: float = None,  # Take-profit as decimal (None = let winners run)
+        # NEW: Adaptive threshold settings
+        use_adaptive_threshold: bool = False,
+        trend_efficiency_col_idx: int = None,  # Index of trend_efficiency in features
+        vol_ratio_col_idx: int = None,          # Index of vol_ratio in features
     ):
         super().__init__()
         self.model = model
+        self.base_threshold = trade_threshold
         self.trade_threshold = trade_threshold
         self.direction_threshold = direction_threshold
         self.max_position = max_position
@@ -303,24 +329,92 @@ class CalibratedTwoStageModel(nn.Module):
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
 
+        # Adaptive threshold config
+        self.use_adaptive_threshold = use_adaptive_threshold
+        self.trend_efficiency_col_idx = trend_efficiency_col_idx
+        self.vol_ratio_col_idx = vol_ratio_col_idx
+
     def forward(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
         """Pass through to underlying model."""
         return self.model(prices, features)
+
+    def compute_adaptive_threshold(
+        self,
+        features: torch.Tensor,
+        trend_efficiency: torch.Tensor = None,
+        vol_ratio: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-sample adaptive threshold based on regime features.
+
+        Args:
+            features: [batch, window_size, n_features] - full feature tensor
+            trend_efficiency: [batch] - optional pre-computed values
+            vol_ratio: [batch] - optional pre-computed values
+
+        Returns:
+            threshold: [batch] - adaptive threshold per sample
+        """
+        batch_size = features.shape[0]
+        device = features.device
+
+        # Start with base threshold
+        threshold = torch.full((batch_size,), self.base_threshold, device=device)
+
+        if not self.use_adaptive_threshold:
+            return threshold
+
+        # Extract regime features from last timestep
+        last_features = features[:, -1, :]  # [batch, n_features]
+
+        # Get trend efficiency
+        if trend_efficiency is None and self.trend_efficiency_col_idx is not None:
+            trend_efficiency = last_features[:, self.trend_efficiency_col_idx]
+
+        # Get vol ratio
+        if vol_ratio is None and self.vol_ratio_col_idx is not None:
+            vol_ratio = last_features[:, self.vol_ratio_col_idx]
+
+        # Apply adjustments
+        if trend_efficiency is not None:
+            # Low trend efficiency = choppy market = higher threshold
+            very_choppy_mask = trend_efficiency < self.TREND_EFFICIENCY_LOW
+            somewhat_choppy_mask = (trend_efficiency >= self.TREND_EFFICIENCY_LOW) & \
+                                   (trend_efficiency < self.TREND_EFFICIENCY_MED)
+
+            threshold = torch.where(very_choppy_mask, threshold + self.VERY_CHOPPY_ADJUSTMENT, threshold)
+            threshold = torch.where(somewhat_choppy_mask, threshold + self.CHOPPY_ADJUSTMENT, threshold)
+
+        if vol_ratio is not None:
+            # High vol ratio = elevated uncertainty = higher threshold
+            high_vol_mask = vol_ratio > self.VOL_RATIO_HIGH
+            threshold = torch.where(high_vol_mask, threshold + self.HIGH_VOL_ADJUSTMENT, threshold)
+
+        # Cap at maximum
+        threshold = torch.clamp(threshold, max=self.MAX_THRESHOLD)
+
+        return threshold
 
     @torch.no_grad()
     def predict_with_sizing(
         self,
         prices: torch.Tensor,
         features: torch.Tensor,
-        volatility: torch.Tensor = None
+        volatility: torch.Tensor = None,
+        trend_efficiency: torch.Tensor = None,
+        vol_ratio: torch.Tensor = None,
     ) -> dict:
         """
-        Get predictions with calibrated thresholds and regime filtering.
+        Get predictions with ADAPTIVE thresholds and regime filtering.
+
+        MODIFIED: Now uses per-sample adaptive threshold based on regime features.
 
         Args:
             prices: [batch, window_size, n_price_features]
             features: [batch, window_size, n_engineered_features]
             volatility: [batch] optional volatility values for regime filtering
+            trend_efficiency: [batch] optional pre-computed trend efficiency values
+            vol_ratio: [batch] optional pre-computed volatility ratio values
 
         Returns:
             dict with:
@@ -330,6 +424,7 @@ class CalibratedTwoStageModel(nn.Module):
             - trade_prob: [batch] probability of trade
             - direction_confidence: [batch] confidence in direction
             - regime_filtered: [batch] bool - True if filtered by regime
+            - adaptive_threshold: [batch] - the threshold used per sample (NEW)
         """
         outputs = self.model(prices, features)
 
@@ -341,8 +436,13 @@ class CalibratedTwoStageModel(nn.Module):
         long_prob = direction_probs[:, 0]   # P(long)
         short_prob = direction_probs[:, 1]  # P(short)
 
-        # Apply calibrated threshold
-        should_trade = trade_prob >= self.trade_threshold
+        # ADAPTIVE THRESHOLD - compute per-sample threshold
+        threshold = self.compute_adaptive_threshold(
+            features, trend_efficiency, vol_ratio
+        )
+
+        # Apply threshold (now per-sample)
+        should_trade = trade_prob >= threshold
 
         # Volatility regime filtering
         regime_filtered = torch.zeros_like(should_trade)
@@ -364,8 +464,8 @@ class CalibratedTwoStageModel(nn.Module):
 
         # Calculate position size if enabled
         if self.use_position_sizing:
-            # Scale trade_prob from [threshold, 1] to [0, 1]
-            scaled_prob = (trade_prob - self.trade_threshold) / (1.0 - self.trade_threshold)
+            # Scale trade_prob from [threshold, 1] to [0, 1] (using per-sample threshold)
+            scaled_prob = (trade_prob - threshold) / (1.0 - threshold)
             scaled_prob = scaled_prob.clamp(0, 1)
 
             # Combine with direction confidence
@@ -391,6 +491,7 @@ class CalibratedTwoStageModel(nn.Module):
             'long_prob': long_prob,
             'short_prob': short_prob,
             'regime_filtered': regime_filtered,
+            'adaptive_threshold': threshold,  # NEW: return the threshold used
         }
 
     def get_trade_signal(

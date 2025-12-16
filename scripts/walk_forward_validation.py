@@ -85,9 +85,10 @@ def get_model_config(n_price_features: int, n_engineered_features: int, tradeabl
 
 # Inference configuration - FROZEN
 INFERENCE_CONFIG = {
-    'trade_threshold': 0.55,
+    'trade_threshold': 0.55,          # Base threshold
     'filter_high_volatility': True,
     'stop_loss_pct': -0.02,  # -2.0% stop-loss (critical for limiting tail risk)
+    'use_adaptive_threshold': True,   # NEW: Enable adaptive threshold
 }
 
 # Test periods
@@ -368,21 +369,36 @@ def evaluate_period(
     test_loader: DataLoader,
     config: SPHNetConfig,
     trade_threshold: float = 0.55,
-    filter_high_vol: bool = True
+    filter_high_vol: bool = True,
+    use_adaptive_threshold: bool = True,  # NEW
+    feature_info: dict = None,             # NEW
 ) -> Dict:
     """
-    Evaluate model on test period.
+    Evaluate model on test period with adaptive threshold.
 
     Returns comprehensive metrics without any modification.
     """
     device = torch.device(config.device)
+
+    # Get feature indices for adaptive threshold
+    trend_efficiency_idx = None
+    vol_ratio_idx = None
+    if feature_info and use_adaptive_threshold:
+        eng_cols = feature_info.get('engineered_columns', [])
+        if 'trend_efficiency' in eng_cols:
+            trend_efficiency_idx = eng_cols.index('trend_efficiency')
+        if 'vol_ratio' in eng_cols:
+            vol_ratio_idx = eng_cols.index('vol_ratio')
 
     # Wrap with calibration
     calibrated_model = CalibratedTwoStageModel(
         model,
         trade_threshold=trade_threshold,
         filter_high_volatility=filter_high_vol,
-        use_position_sizing=False
+        use_position_sizing=False,
+        use_adaptive_threshold=use_adaptive_threshold,
+        trend_efficiency_col_idx=trend_efficiency_idx,
+        vol_ratio_col_idx=vol_ratio_idx,
     )
     calibrated_model.to(device)
     calibrated_model.eval()
@@ -786,10 +802,16 @@ def run_walk_forward_validation():
 
             # Evaluate
             logger.info("Evaluating on test period...")
+            # Build feature_info for adaptive threshold
+            feature_info_for_eval = {
+                'engineered_columns': available_feature_cols
+            }
             metrics, predictions_df = evaluate_period(
                 model, test_loader, config,
                 trade_threshold=INFERENCE_CONFIG['trade_threshold'],
-                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility']
+                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility'],
+                use_adaptive_threshold=INFERENCE_CONFIG.get('use_adaptive_threshold', False),
+                feature_info=feature_info_for_eval
             )
 
             # Store results

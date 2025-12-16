@@ -49,6 +49,9 @@ def load_calibrated_model(
     filter_high_volatility: bool = True,
     stop_loss_pct: float = -0.02,  # -2.0% stop-loss
     take_profit_pct: float = None,   # None = let winners run (positive skew)
+    # NEW: Adaptive threshold params
+    use_adaptive_threshold: bool = False,
+    feature_info_path: Path = None,  # To get feature column indices
 ) -> CalibratedTwoStageModel:
     """Load trained model and wrap with calibration and risk management."""
 
@@ -59,6 +62,24 @@ def load_calibrated_model(
     model = TwoStageModel(config)
     model.load_state_dict(checkpoint['model_state_dict'])
 
+    # Find regime feature indices if adaptive threshold enabled
+    trend_efficiency_idx = None
+    vol_ratio_idx = None
+
+    if use_adaptive_threshold and feature_info_path and feature_info_path.exists():
+        with open(feature_info_path) as f:
+            feature_info = json.load(f)
+        eng_cols = feature_info.get('engineered_columns', [])
+
+        if 'trend_efficiency' in eng_cols:
+            trend_efficiency_idx = eng_cols.index('trend_efficiency')
+        if 'vol_ratio' in eng_cols:
+            vol_ratio_idx = eng_cols.index('vol_ratio')
+
+        logger.info(f"Adaptive threshold enabled:")
+        logger.info(f"  trend_efficiency index: {trend_efficiency_idx}")
+        logger.info(f"  vol_ratio index: {vol_ratio_idx}")
+
     # Wrap with calibration and risk management
     calibrated = CalibratedTwoStageModel(
         model,
@@ -67,6 +88,9 @@ def load_calibrated_model(
         use_position_sizing=False,  # Equal sizing works better
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct,
+        use_adaptive_threshold=use_adaptive_threshold,
+        trend_efficiency_col_idx=trend_efficiency_idx,
+        vol_ratio_col_idx=vol_ratio_idx,
     )
 
     return calibrated, config
