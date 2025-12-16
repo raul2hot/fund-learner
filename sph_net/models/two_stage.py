@@ -304,6 +304,9 @@ class CalibratedTwoStageModel(nn.Module):
 
     # Confidence capping for inverse regime (NEW)
     MAX_CONFIDENCE_CHOPPY = 0.65    # Cap confidence in very choppy markets
+    # CRITICAL: Only apply confidence cap when batch trade frequency is HIGH
+    # High trade frequency indicates model is overconfident/inverted
+    CONFIDENCE_CAP_FREQ_THRESHOLD = 0.10  # Only cap when >10% of batch would trade
 
     def __init__(
         self,
@@ -321,6 +324,7 @@ class CalibratedTwoStageModel(nn.Module):
         trend_efficiency_col_idx: int = None,  # Index of trend_efficiency in features
         vol_ratio_col_idx: int = None,          # Index of vol_ratio in features
         use_confidence_capping: bool = False,   # Cap confidence in choppy markets
+        confidence_cap_freq_threshold: float = 0.10,  # Only cap when batch freq > this
     ):
         super().__init__()
         self.model = model
@@ -339,6 +343,7 @@ class CalibratedTwoStageModel(nn.Module):
         self.trend_efficiency_col_idx = trend_efficiency_col_idx
         self.vol_ratio_col_idx = vol_ratio_col_idx
         self.use_confidence_capping = use_confidence_capping
+        self.confidence_cap_freq_threshold = confidence_cap_freq_threshold
 
     def forward(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
         """Pass through to underlying model."""
@@ -507,15 +512,21 @@ class CalibratedTwoStageModel(nn.Module):
         # Apply adaptive threshold (now per-sample)
         should_trade = trade_prob >= adaptive_threshold
 
-        # CONFIDENCE CAPPING (NEW)
-        # In choppy markets, cap confidence to avoid inverse correlation
+        # FREQUENCY-CONDITIONAL CONFIDENCE CAPPING (NEW)
+        # Only apply confidence cap when batch trade frequency is HIGH
+        # High frequency indicates model is overconfident (inverted confidence pattern)
         confidence_capped = torch.zeros_like(should_trade)
         if self.use_confidence_capping:
-            max_confidence = self.compute_confidence_cap(features, trend_efficiency)
-            # Filter trades where confidence exceeds cap
-            exceeds_cap = trade_prob > max_confidence
-            confidence_capped = exceeds_cap & should_trade
-            should_trade = should_trade & ~exceeds_cap
+            # Compute batch trade frequency (what % of batch would trade)
+            batch_trade_freq = should_trade.float().mean().item()
+
+            # Only apply cap if frequency exceeds threshold (default 10%)
+            if batch_trade_freq > self.confidence_cap_freq_threshold:
+                max_confidence = self.compute_confidence_cap(features, trend_efficiency)
+                # Filter trades where confidence exceeds cap
+                exceeds_cap = trade_prob > max_confidence
+                confidence_capped = exceeds_cap & should_trade
+                should_trade = should_trade & ~exceeds_cap
 
         # Volatility regime filtering (unchanged)
         regime_filtered = torch.zeros_like(should_trade)

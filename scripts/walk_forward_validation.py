@@ -91,6 +91,9 @@ INFERENCE_CONFIG = {
     # NEW: Adaptive threshold settings (regime-aware confidence filtering)
     'use_adaptive_threshold': True,   # Enable adaptive threshold based on regime
     'use_confidence_capping': True,   # Cap high confidence in choppy markets
+    # CRITICAL: Only apply confidence cap when batch trade frequency is HIGH
+    # This fixes Luna/FTX regression - cap only helps when model is overconfident
+    'confidence_cap_freq_threshold': 0.10,  # Only cap when >10% of batch would trade
 }
 
 # Test periods
@@ -398,6 +401,7 @@ def evaluate_period(
     feature_cols: list = None,  # NEW: feature columns for regime detection
     use_adaptive_threshold: bool = True,  # NEW: enable adaptive threshold
     use_confidence_capping: bool = True,  # NEW: cap high confidence in choppy markets
+    confidence_cap_freq_threshold: float = 0.10,  # NEW: only cap when freq > this
 ) -> Dict:
     """
     Evaluate model on test period with ADAPTIVE threshold.
@@ -429,6 +433,7 @@ def evaluate_period(
         trend_efficiency_col_idx=trend_efficiency_idx,
         vol_ratio_col_idx=vol_ratio_idx,
         use_confidence_capping=use_confidence_capping,
+        confidence_cap_freq_threshold=confidence_cap_freq_threshold,
     )
     calibrated_model.to(device)
     calibrated_model.eval()
@@ -850,6 +855,7 @@ def run_walk_forward_validation():
                 feature_cols=available_feature_cols,  # NEW: pass feature columns for regime detection
                 use_adaptive_threshold=INFERENCE_CONFIG.get('use_adaptive_threshold', True),
                 use_confidence_capping=INFERENCE_CONFIG.get('use_confidence_capping', True),
+                confidence_cap_freq_threshold=INFERENCE_CONFIG.get('confidence_cap_freq_threshold', 0.10),
             )
 
             # Store results
