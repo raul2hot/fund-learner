@@ -125,7 +125,7 @@ class TradingDataset(Dataset):
         return {
             'prices': torch.tensor(prices, dtype=torch.float32),
             'features': torch.tensor(features, dtype=torch.float32),
-            'label': torch.tensor(self.labels[label_idx], dtype=torch.long),
+            'label': torch.tensor(int(self.labels[label_idx]), dtype=torch.long),
             'next_return': torch.tensor(self.next_return[label_idx], dtype=torch.float32),
             'next_mae_long': torch.tensor(self.next_mae_long[label_idx], dtype=torch.float32),
             'next_mae_short': torch.tensor(self.next_mae_short[label_idx], dtype=torch.float32),
