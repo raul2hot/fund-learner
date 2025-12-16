@@ -148,6 +148,15 @@ TEST_PERIODS = [
         is_primary=True,
         description='Bitcoin ETF approval, institutional inflow'
     ),
+    TestPeriod(
+        period_id='period_5_full',
+        name='Full Data Holdout',
+        train_end='2024-09-30 23:59:59',
+        test_start='2024-10-01 00:00:00',
+        test_end='2025-12-15 23:59:59',
+        is_primary=True,
+        description='Full data holdout test (~15% most recent data, aligns with prepare_data.py split)'
+    ),
 ]
 
 
@@ -545,8 +554,8 @@ def compute_trading_metrics(results_df: pd.DataFrame, stop_loss_pct: float = Non
 def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
     """Generate final summary report."""
 
-    # Aggregate primary periods (1-4)
-    primary_ids = ['period_1_may2021', 'period_2_luna', 'period_3_ftx', 'period_4_etf']
+    # Aggregate primary periods (1-5)
+    primary_ids = ['period_1_may2021', 'period_2_luna', 'period_3_ftx', 'period_4_etf', 'period_5_full']
 
     primary_returns = []
     primary_returns_no_sl = []
@@ -620,27 +629,30 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
 
 
 def compute_verdict(n_profitable: int, avg_return: float, avg_sharpe: float, worst_return: float) -> Dict:
-    """Compute final verdict based on primary periods."""
+    """Compute final verdict based on primary periods (5 periods total)."""
 
-    # Grading logic
+    # Grading logic (updated for 5 primary periods)
     if worst_return < -30:
         grade = 'F'
         reasoning = f'Failed: Catastrophic loss in one period ({worst_return:.1f}%)'
-    elif n_profitable >= 4 and avg_sharpe > 1.5:
+    elif n_profitable >= 5 and avg_sharpe > 1.5:
         grade = 'A'
-        reasoning = 'Production Ready: All periods profitable with excellent risk-adjusted returns'
-    elif n_profitable >= 3 and avg_sharpe > 1.0:
+        reasoning = 'Production Ready: All 5 periods profitable with excellent risk-adjusted returns'
+    elif n_profitable >= 4 and avg_sharpe > 1.0:
         grade = 'B'
-        reasoning = 'Promising: Most periods profitable with good risk metrics'
-    elif n_profitable >= 3 and avg_sharpe > 0.8:
+        reasoning = 'Promising: 4/5 periods profitable with good risk metrics'
+    elif n_profitable >= 4 and avg_sharpe > 0.8:
         grade = 'B'
-        reasoning = 'Promising: 3/4 periods profitable, meets minimum Sharpe requirement'
-    elif n_profitable >= 2 and avg_sharpe > 0.5:
+        reasoning = 'Promising: 4/5 periods profitable, meets minimum Sharpe requirement'
+    elif n_profitable >= 3 and avg_sharpe > 0.5:
         grade = 'C'
         reasoning = 'Needs Work: Mixed results, consider regime-specific models'
+    elif n_profitable >= 2:
+        grade = 'D'
+        reasoning = 'Significant Issues: Only 2/5 periods profitable'
     elif n_profitable >= 1:
         grade = 'D'
-        reasoning = 'Significant Issues: Only one period profitable'
+        reasoning = 'Significant Issues: Only 1/5 period profitable'
     else:
         grade = 'F'
         reasoning = 'Failed: No profitable periods'
@@ -683,7 +695,7 @@ def print_summary(summary: Dict):
     print("AGGREGATED (PRIMARY PERIODS ONLY):")
     print("-" * 100)
     agg = summary['aggregated']
-    print(f"Profitable Periods:    {agg['primary_periods_profitable']}/4")
+    print(f"Profitable Periods:    {agg['primary_periods_profitable']}/5")
     print(f"Average Return:        {agg['average_return']:+.2f}% (with stop-loss)")
     print(f"Avg Return (no SL):    {agg.get('average_return_no_sl', agg['average_return']):+.2f}%")
     print(f"Average Sharpe:        {agg['average_sharpe']:.2f}")
