@@ -92,8 +92,13 @@ def main():
         epochs=100,
         patience=25,         # More patience
         class_weights=class_weights,
-        focal_gamma=1.5,     # Reduced from 2.0
-        device='cuda'
+        focal_gamma=2.0,     # Standard focal loss gamma
+        device='cuda',
+        # === NEW: Enable Trading-Aware Loss ===
+        use_trading_aware_loss=True,
+        fn_penalty=3.0,      # Penalize missing trades 3x more
+        fp_penalty=1.5,      # Penalize false trades 1.5x
+        direction_penalty=2.0  # Penalize wrong direction 2x
     )
 
     # === Create DataLoaders ===
