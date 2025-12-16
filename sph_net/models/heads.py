@@ -1,8 +1,81 @@
-"""Prediction heads for SPH-Net"""
+"""
+Prediction Heads for SPH-Net
+
+Updated for 5-class classification.
+"""
 
 import torch
 import torch.nn as nn
 
+
+class ClassificationHead(nn.Module):
+    """
+    5-Class classification head.
+
+    Outputs logits for each class:
+    0: HIGH_BULL
+    1: BULL
+    2: RANGE_BOUND
+    3: BEAR
+    4: LOW_BEAR
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_classes: int = 5,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, n_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, d_model]
+        Returns:
+            logits: [batch, n_classes]
+        """
+        return self.head(x)
+
+
+class AuxiliaryRegressionHead(nn.Module):
+    """
+    Auxiliary head for return prediction.
+
+    Helps with feature learning - predicts expected return.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, d_model]
+        Returns:
+            return_pred: [batch, 1]
+        """
+        return self.head(x).squeeze(-1)
+
+
+# Keep legacy heads for backwards compatibility
 class RegressionHead(nn.Module):
     """Predicts continuous return values"""
 
@@ -16,25 +89,7 @@ class RegressionHead(nn.Module):
         )
 
     def forward(self, x):
-        # x: [batch, d_model] (last token or pooled)
         return self.head(x)
-
-
-class ClassificationHead(nn.Module):
-    """Predicts direction (up/down)"""
-
-    def __init__(self, d_model: int, horizon: int = 1, dropout: float = 0.1):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, horizon)  # Binary classification per horizon
-        )
-
-    def forward(self, x):
-        # x: [batch, d_model]
-        return self.head(x)  # Logits, apply sigmoid for probabilities
 
 
 class UncertaintyHead(nn.Module):
@@ -47,7 +102,7 @@ class UncertaintyHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, horizon),
-            nn.Softplus()  # Ensure positive variance
+            nn.Softplus()
         )
 
     def forward(self, x):
