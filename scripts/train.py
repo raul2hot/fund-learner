@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 import pandas as pd
+import numpy as np
 import json
 import logging
 import torch
@@ -59,36 +60,39 @@ def main():
 
     # === Compute Class Weights from Data ===
     # Higher weights for rare classes to address imbalance
+    # But capped to prevent over-prediction of rare classes
     label_counts = train_df['label'].value_counts().sort_index()
     total = len(train_df)
 
-    # Inverse frequency weighting with smoothing
+    # Inverse frequency weighting with smoothing, capped at 5.0
+    # Lower cap prevents model from hallucinating trades
     class_weights = []
     for i in range(5):
         count = label_counts.get(i, 1)
-        # Weight = total / (n_classes * count), capped at 20
-        weight = min(total / (5 * count), 20.0)
+        # Weight = sqrt(total / (n_classes * count)) for smoother scaling
+        weight = min(np.sqrt(total / (5 * count)), 5.0)
         class_weights.append(weight)
 
     logger.info(f"Label distribution: {label_counts.to_dict()}")
     logger.info(f"Computed class weights: {[f'{w:.2f}' for w in class_weights]}")
 
     # === Create Model Config ===
+    # Smaller model for ~6K samples (reduced from 1M to ~300K params)
     model_config = SPHNetConfig(
         n_price_features=len(price_cols),
         n_engineered_features=len(eng_cols),
         n_classes=5,
         window_size=64,
-        d_model=128,
-        n_heads=8,
-        n_encoder_layers=3,
-        dropout=0.1,
-        batch_size=64,
-        learning_rate=1e-4,
+        d_model=64,          # Reduced from 128
+        n_heads=4,           # Reduced from 8
+        n_encoder_layers=2,  # Reduced from 3
+        dropout=0.2,         # Increased for regularization
+        batch_size=32,       # Smaller batch
+        learning_rate=5e-5,  # Lower learning rate
         epochs=100,
-        patience=20,  # More patience for imbalanced data
+        patience=25,         # More patience
         class_weights=class_weights,
-        focal_gamma=2.0,
+        focal_gamma=1.5,     # Reduced from 2.0
         device='cuda'
     )
 
