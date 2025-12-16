@@ -53,6 +53,11 @@ class FeaturePipeline:
         ],
         'sentiment': [
             'fng_normalized', 'fng_deviation'
+        ],
+        'regime': [
+            'vol_percentile', 'vol_ratio', 'trend_efficiency',
+            'trend_efficiency_72h', 'bb_width_pct', 'bb_width_percentile',
+            'atr_percentile', 'regime_low_vol', 'regime_high_vol'
         ]
     }
 
@@ -93,6 +98,9 @@ class FeaturePipeline:
 
         # 8. Sentiment features
         result = self.ti.compute_sentiment_features(result)
+
+        # 9. Regime features (helps with distribution shift awareness)
+        result = self.ti.compute_regime_features(result)
 
         logger.info(f"Computed {len(result.columns)} total columns")
 

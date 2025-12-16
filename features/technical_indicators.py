@@ -319,3 +319,107 @@ class TechnicalIndicators:
             result['fng_deviation'] = 0.0
 
         return result
+
+    @staticmethod
+    def compute_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute regime awareness features.
+
+        These help the model understand what kind of market environment it's in:
+        - Volatility regime (low/med/high)
+        - Trend strength (trending vs ranging)
+        - Recent tradeable frequency
+
+        This addresses distribution shift between volatile and calm periods.
+        """
+        result = df.copy()
+
+        # 1. Volatility regime (rolling realized volatility percentile)
+        if 'log_return_1h' in result.columns:
+            # 24h realized volatility
+            result['vol_24h'] = (
+                result['log_return_1h']
+                .rolling(window=24, min_periods=24)
+                .std()
+            )
+
+            # 168h (1 week) realized volatility
+            result['vol_168h'] = (
+                result['log_return_1h']
+                .rolling(window=168, min_periods=168)
+                .std()
+            )
+
+            # Volatility percentile (where does current vol rank vs recent history?)
+            # Rolling 720h (30 days) percentile
+            result['vol_percentile'] = (
+                result['vol_24h']
+                .rolling(window=720, min_periods=168)
+                .apply(lambda x: (x < x.iloc[-1]).mean(), raw=False)
+            )
+
+            # Short-term vs long-term vol ratio (vol regime shift indicator)
+            result['vol_ratio'] = result['vol_24h'] / (result['vol_168h'] + 1e-8)
+
+        else:
+            result['vol_24h'] = 0.0
+            result['vol_168h'] = 0.0
+            result['vol_percentile'] = 0.5
+            result['vol_ratio'] = 1.0
+
+        # 2. Trend strength (are we trending or ranging?)
+        # Use efficiency ratio: net price change / total path length
+        window = 24
+        net_change = result['close'].diff(window).abs()
+        path_length = result['close'].diff().abs().rolling(window=window, min_periods=window).sum()
+        result['trend_efficiency'] = net_change / (path_length + 1e-8)
+
+        # Longer term trend efficiency
+        window_long = 72
+        net_change_long = result['close'].diff(window_long).abs()
+        path_length_long = result['close'].diff().abs().rolling(window=window_long, min_periods=window_long).sum()
+        result['trend_efficiency_72h'] = net_change_long / (path_length_long + 1e-8)
+
+        # 3. Range-bound detector (Bollinger Band width as fraction of price)
+        if 'close' in result.columns:
+            sma_20 = result['close'].rolling(window=20, min_periods=20).mean()
+            std_20 = result['close'].rolling(window=20, min_periods=20).std()
+            bb_width = (2 * std_20) / sma_20
+            result['bb_width_pct'] = bb_width
+
+            # Squeeze indicator (BB width percentile)
+            result['bb_width_percentile'] = (
+                bb_width
+                .rolling(window=480, min_periods=168)  # 20 days lookback
+                .apply(lambda x: (x < x.iloc[-1]).mean(), raw=False)
+            )
+
+        # 4. ATR-based regime
+        if 'atr_24h_pct' in result.columns:
+            # ATR percentile
+            result['atr_percentile'] = (
+                result['atr_24h_pct']
+                .rolling(window=720, min_periods=168)
+                .apply(lambda x: (x < x.iloc[-1]).mean(), raw=False)
+            )
+        else:
+            result['atr_percentile'] = 0.5
+
+        # 5. Categorical regime encoding (for potential model use)
+        # Low vol regime = vol_percentile < 0.33
+        # High vol regime = vol_percentile > 0.67
+        result['regime_low_vol'] = (result['vol_percentile'] < 0.33).astype(float)
+        result['regime_high_vol'] = (result['vol_percentile'] > 0.67).astype(float)
+
+        # Handle NaN values
+        regime_cols = [
+            'vol_24h', 'vol_168h', 'vol_percentile', 'vol_ratio',
+            'trend_efficiency', 'trend_efficiency_72h',
+            'bb_width_pct', 'bb_width_percentile', 'atr_percentile',
+            'regime_low_vol', 'regime_high_vol'
+        ]
+        for col in regime_cols:
+            if col in result.columns:
+                result[col] = result[col].fillna(method='ffill').fillna(0.5 if 'percentile' in col else 0.0)
+
+        return result
