@@ -327,6 +327,7 @@ def train_period_model(
     Train a fresh model for a single period.
 
     CRITICAL: New model from scratch (no transfer learning).
+    CRITICAL: Returns BEST model from early stopping, not final model.
     """
     # Create fresh model
     model = TwoStageModel(config)
@@ -343,6 +344,16 @@ def train_period_model(
     )
 
     final_metrics = trainer.train()
+
+    # CRITICAL: Load the BEST model (saved during early stopping), not the final model
+    # This matches what run_calibrated.py does
+    best_model_path = output_dir / 'best_model.pt'
+    if best_model_path.exists():
+        logger.info(f"  Loading best model from {best_model_path}")
+        checkpoint = torch.load(best_model_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        logger.warning(f"  Best model not found at {best_model_path}, using final model")
 
     return model
 
