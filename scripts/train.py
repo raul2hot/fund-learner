@@ -3,6 +3,7 @@
 Training Script for SPH-Net
 
 Trains the model on prepared data.
+Supports both standard 5-class and two-stage models.
 """
 
 import sys
@@ -17,6 +18,7 @@ import torch
 
 from sph_net.config import SPHNetConfig
 from sph_net.models.sph_net import SPHNet
+from sph_net.models.two_stage import TwoStageModel
 from data.dataset import create_dataloaders
 from training.trainer import Trainer
 
@@ -32,6 +34,10 @@ def main():
     DATA_DIR = Path("prepared_data")
     OUTPUT_DIR = Path("experiments/run_001")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # === MODEL TYPE SELECTION ===
+    # Options: "standard" (5-class) or "two_stage" (recommended for distribution shift)
+    MODEL_TYPE = "two_stage"
 
     # Check if data exists
     if not (DATA_DIR / "train.parquet").exists():
@@ -59,52 +65,51 @@ def main():
     logger.info(f"Val samples: {len(val_df)}")
 
     # === Compute Class Weights from Data ===
-    # Higher weights for rare classes to address imbalance
-    # But capped to prevent over-prediction of rare classes
     label_counts = train_df['label'].value_counts().sort_index()
     total = len(train_df)
 
-    # Inverse frequency weighting with smoothing, capped at 5.0
-    # Lower cap prevents model from hallucinating trades
     class_weights = []
     for i in range(5):
         count = label_counts.get(i, 1)
-        # Weight = sqrt(total / (n_classes * count)) for smoother scaling
         weight = min(np.sqrt(total / (5 * count)), 5.0)
         class_weights.append(weight)
 
     logger.info(f"Label distribution: {label_counts.to_dict()}")
     logger.info(f"Computed class weights: {[f'{w:.2f}' for w in class_weights]}")
 
+    # Compute tradeable ratio for two-stage model
+    tradeable_count = ((train_df['label'] == 0) | (train_df['label'] == 4)).sum()
+    tradeable_ratio = tradeable_count / total
+    tradeable_pos_weight = (1 - tradeable_ratio) / tradeable_ratio
+    logger.info(f"Tradeable ratio: {tradeable_ratio:.2%}, pos_weight: {tradeable_pos_weight:.2f}")
+
     # === Create Model Config ===
-    # Smaller model for ~6K samples (reduced from 1M to ~300K params)
     model_config = SPHNetConfig(
         n_price_features=len(price_cols),
         n_engineered_features=len(eng_cols),
         n_classes=5,
         window_size=64,
-        d_model=64,          # Reduced from 128
-        n_heads=4,           # Reduced from 8
-        n_encoder_layers=2,  # Reduced from 3
-        dropout=0.2,         # Increased for regularization
-        batch_size=32,       # Smaller batch
-        learning_rate=5e-5,  # Lower learning rate
+        d_model=64,
+        n_heads=4,
+        n_encoder_layers=2,
+        dropout=0.2,
+        batch_size=32,
+        learning_rate=5e-5,
         epochs=100,
-        patience=25,         # More patience
+        patience=25,
         class_weights=class_weights,
-        focal_gamma=2.0,     # Standard focal loss gamma
+        focal_gamma=2.0,
         device='cuda',
-        # === NEW: Enable Trading-Aware Loss ===
-        use_trading_aware_loss=True,
-        fn_penalty=3.0,      # Penalize missing trades 3x more
-        fp_penalty=1.5,      # Penalize false trades 1.5x
-        direction_penalty=2.0  # Penalize wrong direction 2x
+        # Model type
+        model_type=MODEL_TYPE,
+        # Two-stage parameters
+        tradeable_pos_weight=tradeable_pos_weight,
     )
 
     # === Create DataLoaders ===
     logger.info("Creating DataLoaders...")
     train_loader, val_loader, _ = create_dataloaders(
-        train_df, val_df, val_df,  # Use val as placeholder for test
+        train_df, val_df, val_df,
         price_columns=price_cols,
         feature_columns=eng_cols,
         window_size=model_config.window_size,
@@ -115,8 +120,13 @@ def main():
     logger.info(f"Val batches: {len(val_loader)}")
 
     # === Create Model ===
-    logger.info("Creating model...")
-    model = SPHNet(model_config)
+    logger.info(f"Creating {MODEL_TYPE} model...")
+    if MODEL_TYPE == "two_stage":
+        model = TwoStageModel(model_config)
+        logger.info("Using Two-Stage Model: Stage1=Tradeable?, Stage2=Long/Short")
+    else:
+        model = SPHNet(model_config)
+        logger.info("Using Standard 5-class Model")
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
