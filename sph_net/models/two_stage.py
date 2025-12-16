@@ -244,6 +244,15 @@ class CalibratedTwoStageModel(nn.Module):
     2. Volatility regime filtering (avoid high volatility)
     3. Optional confidence-based position sizing
     4. Stop-loss and take-profit risk management
+    5. ADAPTIVE THRESHOLD based on regime features (NEW)
+    6. CONFIDENCE CAPPING in choppy markets (NEW)
+
+    CRITICAL FINDING (May 2021 analysis):
+    The model can be "confidently wrong" - in choppy markets, HIGH confidence
+    trades LOSE money while LOW confidence trades are profitable. This is an
+    INVERSE confidence pattern that requires:
+    - Capping maximum confidence in choppy markets
+    - Increasing minimum threshold when trend_efficiency is low
 
     Optimal settings based on backtesting (2025 data, 343 days):
     - trade_threshold=0.55: Best risk-adjusted returns
@@ -267,7 +276,10 @@ class CalibratedTwoStageModel(nn.Module):
         calibrated = CalibratedTwoStageModel(
             model,
             trade_threshold=0.55,
-            stop_loss_pct=-0.0178  # -1.78% stop-loss
+            stop_loss_pct=-0.0178,  # -1.78% stop-loss
+            use_adaptive_threshold=True,  # Enable regime-aware filtering
+            trend_efficiency_col_idx=2,   # Index of trend_efficiency in features
+            vol_ratio_col_idx=1,          # Index of vol_ratio in features
         )
         results = calibrated.predict_with_sizing(prices, features)
     """
@@ -280,10 +292,23 @@ class CalibratedTwoStageModel(nn.Module):
     DEFAULT_STOP_LOSS = -0.02     # -2.0% stop-loss
     DEFAULT_TAKE_PROFIT = None    # Let winners run (positive skew)
 
+    # Regime detection thresholds for adaptive threshold (NEW)
+    TREND_EFFICIENCY_LOW = 0.3      # Below this = very choppy market
+    TREND_EFFICIENCY_MED = 0.5      # Below this = somewhat choppy
+    VOL_RATIO_HIGH = 1.3            # Above this = elevated short-term volatility
+
+    # Threshold adjustments (NEW)
+    BASE_THRESHOLD = 0.55
+    CHOPPY_ADJUSTMENT = 0.05        # Add this per choppy condition
+    MAX_THRESHOLD = 0.70            # Never go above this
+
+    # Confidence capping for inverse regime (NEW)
+    MAX_CONFIDENCE_CHOPPY = 0.65    # Cap confidence in very choppy markets
+
     def __init__(
         self,
         model: 'TwoStageModel',
-        trade_threshold: float = 0.55,  # Optimal from analysis
+        trade_threshold: float = 0.55,  # Base threshold (may be adjusted dynamically)
         direction_threshold: float = 0.5,
         max_position: float = 1.0,
         use_position_sizing: bool = False,  # Disabled - doesn't improve returns
@@ -291,9 +316,15 @@ class CalibratedTwoStageModel(nn.Module):
         vol_threshold: float = None,  # Custom high vol threshold (auto if None)
         stop_loss_pct: float = None,  # Stop-loss as decimal (e.g., -0.0178 for -1.78%)
         take_profit_pct: float = None,  # Take-profit as decimal (None = let winners run)
+        # NEW: Adaptive threshold settings
+        use_adaptive_threshold: bool = False,
+        trend_efficiency_col_idx: int = None,  # Index of trend_efficiency in features
+        vol_ratio_col_idx: int = None,          # Index of vol_ratio in features
+        use_confidence_capping: bool = False,   # Cap confidence in choppy markets
     ):
         super().__init__()
         self.model = model
+        self.base_threshold = trade_threshold
         self.trade_threshold = trade_threshold
         self.direction_threshold = direction_threshold
         self.max_position = max_position
@@ -303,24 +334,148 @@ class CalibratedTwoStageModel(nn.Module):
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
 
+        # Adaptive threshold config (NEW)
+        self.use_adaptive_threshold = use_adaptive_threshold
+        self.trend_efficiency_col_idx = trend_efficiency_col_idx
+        self.vol_ratio_col_idx = vol_ratio_col_idx
+        self.use_confidence_capping = use_confidence_capping
+
     def forward(self, prices: torch.Tensor, features: torch.Tensor) -> dict:
         """Pass through to underlying model."""
         return self.model(prices, features)
+
+    def compute_adaptive_threshold(
+        self,
+        features: torch.Tensor,
+        trend_efficiency: torch.Tensor = None,
+        vol_ratio: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-sample adaptive threshold based on regime features.
+
+        In choppy markets (low trend_efficiency, high vol_ratio), the model
+        tends to be confidently wrong. We increase the threshold to filter
+        out trades where confidence is unreliable.
+
+        Args:
+            features: [batch, window_size, n_features] - full feature tensor
+            trend_efficiency: [batch] - optional pre-computed values
+            vol_ratio: [batch] - optional pre-computed values
+
+        Returns:
+            threshold: [batch] - adaptive threshold per sample
+        """
+        batch_size = features.shape[0]
+        device = features.device
+
+        # Start with base threshold
+        threshold = torch.full((batch_size,), self.base_threshold, device=device)
+
+        if not self.use_adaptive_threshold:
+            return threshold
+
+        # Extract regime features from last timestep
+        last_features = features[:, -1, :]  # [batch, n_features]
+
+        # Get trend efficiency
+        if trend_efficiency is None and self.trend_efficiency_col_idx is not None:
+            trend_efficiency = last_features[:, self.trend_efficiency_col_idx]
+
+        # Get vol ratio
+        if vol_ratio is None and self.vol_ratio_col_idx is not None:
+            vol_ratio = last_features[:, self.vol_ratio_col_idx]
+
+        # Apply adjustments based on regime
+        if trend_efficiency is not None:
+            # Low trend efficiency = choppy market = higher threshold
+            # Very choppy (< 0.3): add 0.10 to threshold
+            very_choppy_mask = trend_efficiency < self.TREND_EFFICIENCY_LOW
+            # Somewhat choppy (0.3-0.5): add 0.05 to threshold
+            somewhat_choppy_mask = (
+                (trend_efficiency >= self.TREND_EFFICIENCY_LOW) &
+                (trend_efficiency < self.TREND_EFFICIENCY_MED)
+            )
+
+            threshold = torch.where(very_choppy_mask, threshold + 0.10, threshold)
+            threshold = torch.where(somewhat_choppy_mask, threshold + self.CHOPPY_ADJUSTMENT, threshold)
+
+        if vol_ratio is not None:
+            # High vol ratio = elevated uncertainty = higher threshold
+            high_vol_mask = vol_ratio > self.VOL_RATIO_HIGH
+            threshold = torch.where(high_vol_mask, threshold + self.CHOPPY_ADJUSTMENT, threshold)
+
+        # Cap at maximum
+        threshold = torch.clamp(threshold, max=self.MAX_THRESHOLD)
+
+        return threshold
+
+    def compute_confidence_cap(
+        self,
+        features: torch.Tensor,
+        trend_efficiency: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-sample maximum confidence cap for inverse regime detection.
+
+        In choppy markets, HIGH confidence trades often LOSE money (inverse
+        correlation). This method computes a cap on confidence to filter out
+        trades where the model is confidently wrong.
+
+        Args:
+            features: [batch, window_size, n_features] - full feature tensor
+            trend_efficiency: [batch] - optional pre-computed values
+
+        Returns:
+            max_confidence: [batch] - maximum confidence to accept per sample
+        """
+        batch_size = features.shape[0]
+        device = features.device
+
+        # Start with no cap (1.0)
+        max_confidence = torch.ones(batch_size, device=device)
+
+        if not self.use_confidence_capping:
+            return max_confidence
+
+        # Extract regime features from last timestep
+        last_features = features[:, -1, :]
+
+        # Get trend efficiency
+        if trend_efficiency is None and self.trend_efficiency_col_idx is not None:
+            trend_efficiency = last_features[:, self.trend_efficiency_col_idx]
+
+        if trend_efficiency is not None:
+            # In very choppy markets, cap confidence to avoid inverse correlation
+            very_choppy_mask = trend_efficiency < self.TREND_EFFICIENCY_LOW
+            max_confidence = torch.where(
+                very_choppy_mask,
+                torch.full_like(max_confidence, self.MAX_CONFIDENCE_CHOPPY),
+                max_confidence
+            )
+
+        return max_confidence
 
     @torch.no_grad()
     def predict_with_sizing(
         self,
         prices: torch.Tensor,
         features: torch.Tensor,
-        volatility: torch.Tensor = None
+        volatility: torch.Tensor = None,
+        trend_efficiency: torch.Tensor = None,
+        vol_ratio: torch.Tensor = None,
     ) -> dict:
         """
-        Get predictions with calibrated thresholds and regime filtering.
+        Get predictions with ADAPTIVE thresholds and regime filtering.
+
+        MODIFIED: Now uses per-sample adaptive threshold based on regime features.
+        Also supports confidence capping to handle inverse confidence patterns.
 
         Args:
             prices: [batch, window_size, n_price_features]
             features: [batch, window_size, n_engineered_features]
             volatility: [batch] optional volatility values for regime filtering
+            trend_efficiency: [batch] optional pre-computed trend efficiency values
+            vol_ratio: [batch] optional pre-computed vol ratio values
 
         Returns:
             dict with:
@@ -330,6 +485,8 @@ class CalibratedTwoStageModel(nn.Module):
             - trade_prob: [batch] probability of trade
             - direction_confidence: [batch] confidence in direction
             - regime_filtered: [batch] bool - True if filtered by regime
+            - adaptive_threshold: [batch] - threshold used per sample (NEW)
+            - confidence_capped: [batch] bool - True if confidence was capped (NEW)
         """
         outputs = self.model(prices, features)
 
@@ -341,10 +498,26 @@ class CalibratedTwoStageModel(nn.Module):
         long_prob = direction_probs[:, 0]   # P(long)
         short_prob = direction_probs[:, 1]  # P(short)
 
-        # Apply calibrated threshold
-        should_trade = trade_prob >= self.trade_threshold
+        # ADAPTIVE THRESHOLD (NEW)
+        # Compute per-sample threshold based on regime features
+        adaptive_threshold = self.compute_adaptive_threshold(
+            features, trend_efficiency, vol_ratio
+        )
 
-        # Volatility regime filtering
+        # Apply adaptive threshold (now per-sample)
+        should_trade = trade_prob >= adaptive_threshold
+
+        # CONFIDENCE CAPPING (NEW)
+        # In choppy markets, cap confidence to avoid inverse correlation
+        confidence_capped = torch.zeros_like(should_trade)
+        if self.use_confidence_capping:
+            max_confidence = self.compute_confidence_cap(features, trend_efficiency)
+            # Filter trades where confidence exceeds cap
+            exceeds_cap = trade_prob > max_confidence
+            confidence_capped = exceeds_cap & should_trade
+            should_trade = should_trade & ~exceeds_cap
+
+        # Volatility regime filtering (unchanged)
         regime_filtered = torch.zeros_like(should_trade)
         if self.filter_high_volatility and volatility is not None:
             # Estimate high volatility threshold if not set
@@ -363,9 +536,10 @@ class CalibratedTwoStageModel(nn.Module):
         direction_confidence = torch.abs(long_prob - 0.5) * 2  # 0-1 scale
 
         # Calculate position size if enabled
+        # Use base threshold for position sizing calculation
         if self.use_position_sizing:
-            # Scale trade_prob from [threshold, 1] to [0, 1]
-            scaled_prob = (trade_prob - self.trade_threshold) / (1.0 - self.trade_threshold)
+            # Scale trade_prob from [base_threshold, 1] to [0, 1]
+            scaled_prob = (trade_prob - self.base_threshold) / (1.0 - self.base_threshold)
             scaled_prob = scaled_prob.clamp(0, 1)
 
             # Combine with direction confidence
@@ -391,6 +565,8 @@ class CalibratedTwoStageModel(nn.Module):
             'long_prob': long_prob,
             'short_prob': short_prob,
             'regime_filtered': regime_filtered,
+            'adaptive_threshold': adaptive_threshold,  # NEW: threshold used per sample
+            'confidence_capped': confidence_capped,    # NEW: True if filtered by cap
         }
 
     def get_trade_signal(

@@ -88,6 +88,9 @@ INFERENCE_CONFIG = {
     'trade_threshold': 0.55,
     'filter_high_volatility': True,
     'stop_loss_pct': -0.02,  # -2.0% stop-loss (critical for limiting tail risk)
+    # NEW: Adaptive threshold settings (regime-aware confidence filtering)
+    'use_adaptive_threshold': True,   # Enable adaptive threshold based on regime
+    'use_confidence_capping': True,   # Cap high confidence in choppy markets
 }
 
 # Test periods
@@ -362,27 +365,70 @@ def train_period_model(
 # EVALUATION
 # =============================================================================
 
+def get_regime_feature_indices(feature_cols: list) -> dict:
+    """
+    Get indices of regime features for adaptive threshold.
+
+    These features are used to detect choppy markets and adjust
+    the trade probability threshold accordingly.
+
+    Returns:
+        dict with trend_efficiency_idx, vol_ratio_idx (None if not found)
+    """
+    indices = {
+        'trend_efficiency_idx': None,
+        'vol_ratio_idx': None,
+    }
+
+    if 'trend_efficiency' in feature_cols:
+        indices['trend_efficiency_idx'] = feature_cols.index('trend_efficiency')
+    if 'vol_ratio' in feature_cols:
+        indices['vol_ratio_idx'] = feature_cols.index('vol_ratio')
+
+    return indices
+
+
 @torch.no_grad()
 def evaluate_period(
     model: TwoStageModel,
     test_loader: DataLoader,
     config: SPHNetConfig,
     trade_threshold: float = 0.55,
-    filter_high_vol: bool = True
+    filter_high_vol: bool = True,
+    feature_cols: list = None,  # NEW: feature columns for regime detection
+    use_adaptive_threshold: bool = True,  # NEW: enable adaptive threshold
+    use_confidence_capping: bool = True,  # NEW: cap high confidence in choppy markets
 ) -> Dict:
     """
-    Evaluate model on test period.
+    Evaluate model on test period with ADAPTIVE threshold.
 
     Returns comprehensive metrics without any modification.
+
+    MODIFIED: Now uses regime-aware confidence filtering to handle
+    inverse confidence patterns (e.g., May 2021 where high confidence
+    trades lost money).
     """
     device = torch.device(config.device)
 
-    # Wrap with calibration
+    # Get regime feature indices for adaptive threshold
+    trend_efficiency_idx = None
+    vol_ratio_idx = None
+    if feature_cols and use_adaptive_threshold:
+        indices = get_regime_feature_indices(feature_cols)
+        trend_efficiency_idx = indices['trend_efficiency_idx']
+        vol_ratio_idx = indices['vol_ratio_idx']
+        logger.info(f"  Adaptive threshold enabled: trend_efficiency_idx={trend_efficiency_idx}, vol_ratio_idx={vol_ratio_idx}")
+
+    # Wrap with calibration (NEW: with adaptive threshold settings)
     calibrated_model = CalibratedTwoStageModel(
         model,
         trade_threshold=trade_threshold,
         filter_high_volatility=filter_high_vol,
-        use_position_sizing=False
+        use_position_sizing=False,
+        use_adaptive_threshold=use_adaptive_threshold,
+        trend_efficiency_col_idx=trend_efficiency_idx,
+        vol_ratio_col_idx=vol_ratio_idx,
+        use_confidence_capping=use_confidence_capping,
     )
     calibrated_model.to(device)
     calibrated_model.eval()
@@ -400,7 +446,7 @@ def evaluate_period(
         # Get volatility proxy
         volatility = features[:, -1, :].std(dim=-1)
 
-        # Get predictions
+        # Get predictions (now with adaptive threshold)
         results = calibrated_model.predict_with_sizing(prices, features, volatility)
 
         for i in range(len(results['should_trade'])):
@@ -425,12 +471,23 @@ def evaluate_period(
                 'next_return': next_return[i].item(),
                 'trade_return': trade_return,
                 'trade_mae': trade_mae,
+                'adaptive_threshold': results['adaptive_threshold'][i].item(),  # NEW
+                'confidence_capped': results['confidence_capped'][i].item(),    # NEW
             })
 
     results_df = pd.DataFrame(all_results)
 
     # Compute metrics with stop-loss
     metrics = compute_trading_metrics(results_df, stop_loss_pct=INFERENCE_CONFIG['stop_loss_pct'])
+
+    # Add adaptive threshold stats to metrics
+    if 'adaptive_threshold' in results_df.columns:
+        trades = results_df[results_df['should_trade']]
+        if len(trades) > 0:
+            metrics['avg_adaptive_threshold'] = float(trades['adaptive_threshold'].mean())
+        else:
+            metrics['avg_adaptive_threshold'] = trade_threshold
+        metrics['n_confidence_capped'] = int(results_df['confidence_capped'].sum())
 
     return metrics, results_df
 
@@ -784,12 +841,15 @@ def run_walk_forward_validation():
             logger.info("Training model...")
             model = train_period_model(train_loader, val_loader, config, period_dir)
 
-            # Evaluate
+            # Evaluate with adaptive threshold
             logger.info("Evaluating on test period...")
             metrics, predictions_df = evaluate_period(
                 model, test_loader, config,
                 trade_threshold=INFERENCE_CONFIG['trade_threshold'],
-                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility']
+                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility'],
+                feature_cols=available_feature_cols,  # NEW: pass feature columns for regime detection
+                use_adaptive_threshold=INFERENCE_CONFIG.get('use_adaptive_threshold', True),
+                use_confidence_capping=INFERENCE_CONFIG.get('use_confidence_capping', True),
             )
 
             # Store results
@@ -823,6 +883,11 @@ def run_walk_forward_validation():
             print(f"    Trades:         {metrics['n_trades']}")
             print(f"    Win Rate:       {metrics['win_rate']:.1f}%")
             print(f"    Sharpe Ratio:   {metrics['sharpe_ratio']:.2f}")
+            # NEW: Show adaptive threshold stats
+            if 'avg_adaptive_threshold' in metrics:
+                print(f"    Avg Threshold:  {metrics['avg_adaptive_threshold']:.3f}")
+            if 'n_confidence_capped' in metrics:
+                print(f"    Conf. Capped:   {metrics['n_confidence_capped']}")
 
         except Exception as e:
             logger.error(f"Error processing period {period.name}: {e}")
