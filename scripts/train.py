@@ -57,6 +57,22 @@ def main():
     logger.info(f"Train samples: {len(train_df)}")
     logger.info(f"Val samples: {len(val_df)}")
 
+    # === Compute Class Weights from Data ===
+    # Higher weights for rare classes to address imbalance
+    label_counts = train_df['label'].value_counts().sort_index()
+    total = len(train_df)
+
+    # Inverse frequency weighting with smoothing
+    class_weights = []
+    for i in range(5):
+        count = label_counts.get(i, 1)
+        # Weight = total / (n_classes * count), capped at 20
+        weight = min(total / (5 * count), 20.0)
+        class_weights.append(weight)
+
+    logger.info(f"Label distribution: {label_counts.to_dict()}")
+    logger.info(f"Computed class weights: {[f'{w:.2f}' for w in class_weights]}")
+
     # === Create Model Config ===
     model_config = SPHNetConfig(
         n_price_features=len(price_cols),
@@ -70,8 +86,8 @@ def main():
         batch_size=64,
         learning_rate=1e-4,
         epochs=100,
-        patience=15,
-        class_weights=[2.0, 1.0, 0.5, 1.0, 2.0],
+        patience=20,  # More patience for imbalanced data
+        class_weights=class_weights,
         focal_gamma=2.0,
         device='cuda'
     )
