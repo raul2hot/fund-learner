@@ -99,10 +99,13 @@ def main():
     logger.info("STEP 1: Labeling")
     logger.info("="*50)
 
+    # Labeling thresholds - adjust these based on your data:
+    # - Lower strong_move_threshold = more HIGH_BULL/LOW_BEAR samples
+    # - Higher clean_path_mae_threshold = higher survival rate but noisier signals
     label_config = LabelingConfig(
-        strong_move_threshold=0.015,
-        weak_move_threshold=0.005,
-        clean_path_mae_threshold=0.005
+        strong_move_threshold=0.012,    # 1.2% (was 1.5%) - more tradeable signals
+        weak_move_threshold=0.004,      # 0.4% (was 0.5%) - tighter range filter
+        clean_path_mae_threshold=0.006  # 0.6% (was 0.5%) - better survival rate
     )
     labeler = CandleLabeler(label_config)
 
