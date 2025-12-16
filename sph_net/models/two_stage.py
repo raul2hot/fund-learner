@@ -244,10 +244,17 @@ class CalibratedTwoStageModel(nn.Module):
     2. Volatility regime filtering (avoid high volatility)
     3. Optional confidence-based position sizing
 
-    Optimal settings based on backtesting (2025 data):
-    - trade_threshold=0.55: Best Sharpe ratio (8.55), 603 trades, +25.58% return
+    Optimal settings based on backtesting (2025 data, 343 days):
+    - trade_threshold=0.55: Best risk-adjusted returns
+    - ~320 trades, ~3.9% trade frequency
+    - +32.69% total return, +0.10% per trade
     - Avoid high volatility regime: loses money (-0.015% avg)
     - Position sizing disabled: confidence doesn't correlate with returns
+
+    Note on Sharpe Ratio:
+    - Use trade-frequency annualization, not candle-frequency
+    - With 320 trades over 343 days: ~340 trades/year
+    - Sharpe = (mean/std) * sqrt(340), NOT sqrt(35000)
 
     Usage:
         calibrated = CalibratedTwoStageModel(model, trade_threshold=0.55)

@@ -208,10 +208,14 @@ class PerformanceAnalyzer:
         survival_rate = (trades['trade_mae'] < 0.005).mean() * 100
         correct_class_rate = trades['correct_class'].mean() * 100
 
-        # Sharpe ratio (annualized, assuming 15-min candles)
+        # Sharpe ratio (annualized based on actual trade frequency)
+        # Note: sqrt(35000) assumes trading every 15-min candle, which overstates Sharpe
+        # Use actual trades per year for proper annualization
         if trades['trade_return'].std() > 0:
-            # ~35000 15-min candles per year
-            sharpe = (trades['trade_return'].mean() / trades['trade_return'].std()) * np.sqrt(35000)
+            # Estimate based on ~96 candles/day of test data
+            trading_days = len(df) / 96
+            trades_per_year = n_trades * (365 / max(trading_days, 1))
+            sharpe = (trades['trade_return'].mean() / trades['trade_return'].std()) * np.sqrt(trades_per_year)
         else:
             sharpe = 0.0
 

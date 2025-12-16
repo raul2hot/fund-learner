@@ -148,13 +148,25 @@ def compute_performance(results_df: pd.DataFrame) -> dict:
         metrics['avg_return_per_trade'] = trades['trade_return'].mean() * 100
         metrics['overall_win_rate'] = (trades['trade_return'] > 0).mean() * 100
 
-        # Sharpe ratio (annualized, ~35000 15-min candles/year)
+        # Sharpe ratio (annualized based on actual trading frequency)
+        # Using sqrt(35000) assumes trading every 15-min candle, which overstates Sharpe
+        # Instead, use actual trades per year for proper annualization
         if trades['trade_return'].std() > 0:
+            # Estimate trading days from total samples (assuming ~96 candles/day)
+            trading_days = len(results_df) / 96
+            trades_per_year = len(trades) * (365 / max(trading_days, 1))
             metrics['sharpe_ratio'] = (
+                trades['trade_return'].mean() / trades['trade_return'].std()
+            ) * np.sqrt(trades_per_year)
+            metrics['trades_per_year'] = trades_per_year
+
+            # Also compute the original (overstated) for comparison
+            metrics['sharpe_ratio_original'] = (
                 trades['trade_return'].mean() / trades['trade_return'].std()
             ) * np.sqrt(35000)
         else:
             metrics['sharpe_ratio'] = 0.0
+            metrics['sharpe_ratio_original'] = 0.0
 
     return metrics
 
@@ -201,7 +213,9 @@ def print_report(metrics: dict):
         print(f"Total Return:               {metrics['total_return']:+.2f}%")
         print(f"Avg Return/Trade:           {metrics['avg_return_per_trade']:+.4f}%")
         print(f"Overall Win Rate:           {metrics['overall_win_rate']:.2f}%")
-        print(f"Sharpe Ratio (annualized):  {metrics['sharpe_ratio']:.2f}")
+        print(f"Trades per Year (est.):     {metrics.get('trades_per_year', 'N/A'):.1f}")
+        print(f"Sharpe Ratio (corrected):   {metrics['sharpe_ratio']:.2f}")
+        print(f"Sharpe Ratio (original):    {metrics.get('sharpe_ratio_original', 'N/A'):.2f}  ← overstated")
 
     print("\n" + "=" * 70)
 
