@@ -244,6 +244,11 @@ def evaluate_ensemble_on_period(
         metrics['n_volatility_filtered'] = int(predictions['volatility_filtered'].sum())
         metrics['pct_volatility_filtered'] = predictions['volatility_filtered'].mean() * 100
 
+    # Add agreement filtering stats
+    if 'agreement_filtered' in predictions.columns:
+        metrics['n_agreement_filtered'] = int(predictions['agreement_filtered'].sum())
+        metrics['pct_agreement_filtered'] = predictions['agreement_filtered'].mean() * 100
+
     return metrics
 
 
@@ -302,6 +307,8 @@ def main():
     parser.add_argument('--no-regime-filter', action='store_false',
                         dest='regime_filter',
                         help='Disable regime filter')
+    parser.add_argument('--agreement-threshold', type=float, default=0.0,
+                        help='Min model agreement to trade (0.0=disabled, 0.7=require 70%% agreement)')
     args = parser.parse_args()
 
     # Map method string to enum
@@ -320,6 +327,10 @@ def main():
     print(f"Methodology: Open-to-close returns with MAE-aware stop-loss (same as individual seeds)")
     print(f"Stop-loss: {args.stop_loss * 100:.1f}% (MAE-aware)")
     print(f"Regime filter: {'ENABLED (moderate)' if args.regime_filter else 'DISABLED'}")
+    if args.agreement_threshold > 0:
+        print(f"Agreement threshold: {args.agreement_threshold:.0%} (only trade when models agree)")
+    else:
+        print(f"Agreement threshold: DISABLED (trade even when models disagree)")
     if args.method == 'weighted':
         print(f"Default weight by: {args.weight_by} (temperature={args.temperature})")
         print(f"Note: Early periods use equal weights (no prior crash data available)")
@@ -391,7 +402,8 @@ def main():
                 weight_by_period=weight_period,  # Weight by prior crash performance (or None)
                 seeds=SEEDS,
                 device=device,
-                temperature=args.temperature
+                temperature=args.temperature,
+                agreement_threshold=args.agreement_threshold
             )
 
             # Prepare period data with proper feature computation
@@ -448,11 +460,19 @@ def main():
                   f"Sharpe: {ensemble_metrics['sharpe']:.2f}, "
                   f"Win rate: {ensemble_metrics['win_rate']:.1f}%")
             print(f"  Model agreement: {ensemble_metrics['avg_agreement']:.1%}")
-            # Show stop-loss and regime filter stats
+            # Show filtering stats
             n_stopped = ensemble_metrics.get('n_stopped_out', 0)
             n_regime = ensemble_metrics.get('n_regime_blocked', 0)
-            if n_stopped > 0 or n_regime > 0:
-                print(f"  Stop-loss triggered: {n_stopped}, Regime blocked: {n_regime}")
+            n_agreement = ensemble_metrics.get('n_agreement_filtered', 0)
+            filter_stats = []
+            if n_stopped > 0:
+                filter_stats.append(f"Stop-loss: {n_stopped}")
+            if n_regime > 0:
+                filter_stats.append(f"Regime: {n_regime}")
+            if n_agreement > 0:
+                filter_stats.append(f"Low agreement: {n_agreement}")
+            if filter_stats:
+                print(f"  Trades filtered: {', '.join(filter_stats)}")
             if 'n_volatility_filtered' in ensemble_metrics:
                 print(f"  Volatility filtered: {ensemble_metrics['n_volatility_filtered']} "
                       f"({ensemble_metrics['pct_volatility_filtered']:.1f}%)")
