@@ -1118,3 +1118,104 @@ def calculate_ensemble_trading_returns(
         'n_stopped_out': n_stopped_out,
         'n_regime_blocked': n_regime_blocked,
     }
+
+
+def calculate_individual_seed_returns(
+    predictions: pd.DataFrame,
+    price_data: pd.DataFrame,
+    stop_loss_pct: float = -0.02,
+    seeds: List[int] = None
+) -> Dict[int, float]:
+    """
+    Calculate returns for each individual seed using the SAME methodology as ensemble.
+
+    This enables true apples-to-apples comparison: instead of comparing ensemble
+    returns to saved results (which may use different methodology), we compute
+    individual seed returns using identical calculation.
+
+    Args:
+        predictions: DataFrame with should_trade_seed_X, is_long_seed_X columns
+        price_data: DataFrame with timestamp, next_return, next_mae_long, next_mae_short
+        stop_loss_pct: Stop-loss threshold
+        seeds: List of seeds to compute (auto-detect if None)
+
+    Returns:
+        Dictionary mapping seed -> total_return percentage
+    """
+    # Auto-detect seeds from column names
+    if seeds is None:
+        seeds = []
+        for col in predictions.columns:
+            if col.startswith('should_trade_seed_'):
+                seed = int(col.replace('should_trade_seed_', ''))
+                seeds.append(seed)
+
+    if not seeds:
+        logger.warning("No per-seed predictions found in DataFrame")
+        return {}
+
+    # Get price data columns
+    available_cols = [c for c in price_data.columns if c in
+                      ['timestamp', 'next_return', 'next_mae_long', 'next_mae_short']]
+    price_df = price_data[available_cols].copy()
+
+    # Ensure timestamps match
+    pred_df = predictions.copy()
+    if pred_df['timestamp'].dt.tz is None:
+        pred_df['timestamp'] = pd.to_datetime(pred_df['timestamp']).dt.tz_localize('UTC')
+    if price_df['timestamp'].dt.tz is None:
+        price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
+
+    # Filter and merge
+    pred_timestamps = set(pred_df['timestamp'])
+    price_df_filtered = price_df[price_df['timestamp'].isin(pred_timestamps)].copy()
+
+    merged = pred_df.merge(price_df_filtered, on='timestamp', how='left')
+
+    if 'next_return' not in merged.columns:
+        logger.warning("next_return column not found")
+        return {}
+
+    results = {}
+
+    for seed in seeds:
+        should_trade_col = f'should_trade_seed_{seed}'
+        is_long_col = f'is_long_seed_{seed}'
+
+        if should_trade_col not in merged.columns:
+            continue
+
+        # Calculate position for this seed
+        position = pd.Series(0.0, index=merged.index)
+        trade_mask = merged[should_trade_col]
+        position[trade_mask & merged[is_long_col]] = 1.0
+        position[trade_mask & ~merged[is_long_col]] = -1.0
+
+        # Trade returns
+        trade_return = position * merged['next_return']
+
+        # Apply MAE-aware stop-loss (same as ensemble)
+        if stop_loss_pct is not None:
+            has_mae = 'next_mae_long' in merged.columns and 'next_mae_short' in merged.columns
+
+            if has_mae:
+                long_mask = position == 1.0
+                short_mask = position == -1.0
+
+                long_stopped = long_mask & (merged['next_mae_long'] > abs(stop_loss_pct))
+                short_stopped = short_mask & (merged['next_mae_short'] > abs(stop_loss_pct))
+
+                stopped_mask = long_stopped | short_stopped
+                trade_return[stopped_mask] = stop_loss_pct
+            else:
+                trade_return = trade_return.clip(lower=stop_loss_pct)
+
+        # Total return
+        valid_returns = trade_return.dropna()
+        trade_only = valid_returns[position != 0]
+        total_return = trade_only.sum() * 100  # As percentage
+
+        results[seed] = total_return
+        logger.debug(f"Seed {seed}: {len(trade_only)} trades, {total_return:.2f}% return")
+
+    return results

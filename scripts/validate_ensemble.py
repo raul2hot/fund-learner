@@ -44,6 +44,7 @@ from sph_net.ensemble import (
     create_ensemble_from_walk_forward,
     ensemble_predict_dataframe,
     calculate_ensemble_trading_returns,
+    calculate_individual_seed_returns,
 )
 from features.feature_pipeline import FeaturePipeline
 from labeling.candle_classifier import CandleLabeler, LabelingConfig
@@ -248,6 +249,14 @@ def evaluate_ensemble_on_period(
     if 'agreement_filtered' in predictions.columns:
         metrics['n_agreement_filtered'] = int(predictions['agreement_filtered'].sum())
         metrics['pct_agreement_filtered'] = predictions['agreement_filtered'].mean() * 100
+
+    # Compute individual seed returns using SAME methodology (apples-to-apples)
+    individual_same_method = calculate_individual_seed_returns(
+        predictions,
+        period_data,
+        stop_loss_pct=stop_loss
+    )
+    metrics['individual_same_method'] = individual_same_method
 
     return metrics
 
@@ -491,13 +500,37 @@ def main():
                 print(f"  Volatility filtered: {ensemble_metrics['n_volatility_filtered']} "
                       f"({ensemble_metrics['pct_volatility_filtered']:.1f}%)")
 
-            # Individual seed returns
+            # Individual seed returns (saved results - may use different methodology)
             if any(individual_returns.values()):
-                print(f"\n  Individual seed returns:")
+                print(f"\n  Individual seed returns (saved - may differ):")
                 for seed in sorted(individual_returns.keys()):
                     ret = individual_returns[seed]
                     weight = ensemble.config.weights.get(seed, 0)
                     print(f"    Seed {seed}: {ret:>+8.2f}% (weight={weight:.3f})")
+
+            # APPLES-TO-APPLES comparison using same methodology
+            same_method = ensemble_metrics.get('individual_same_method', {})
+            if same_method:
+                same_method_returns = list(same_method.values())
+                avg_same_method = np.mean(same_method_returns) if same_method_returns else 0
+                improvement_same_method = ensemble_metrics['total_return'] - avg_same_method
+
+                print(f"\n  APPLES-TO-APPLES comparison (same methodology):")
+                for seed in sorted(same_method.keys()):
+                    ret = same_method[seed]
+                    weight = ensemble.config.weights.get(seed, 0)
+                    print(f"    Seed {seed}: {ret:>+8.2f}% (weight={weight:.3f})")
+                print(f"    ----------------------------------------")
+                print(f"    Avg individual:    {avg_same_method:>+8.2f}%")
+                print(f"    Ensemble:          {ensemble_metrics['total_return']:>+8.2f}%")
+                print(f"    Improvement:       {improvement_same_method:>+8.2f}%")
+
+                if improvement_same_method > 0:
+                    print(f"    ✓ Ensemble BEATS average by {improvement_same_method:.2f}%")
+                elif abs(improvement_same_method) < 1.0:
+                    print(f"    ~ Ensemble MATCHES average (diff < 1%)")
+                else:
+                    print(f"    ✗ Ensemble UNDERPERFORMS by {-improvement_same_method:.2f}%")
 
             # DIAGNOSTIC: Single-seed comparison
             if args.single_seed is not None:
