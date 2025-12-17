@@ -70,10 +70,29 @@ class RegimeConfig:
     vol_elevated_threshold: float = 1.5  # 1.5x normal vol triggers ELEVATED
     vol_extreme_threshold: float = 2.5   # 2.5x normal vol triggers EXTREME
 
+    # NEW: Absolute volatility thresholds (annualized %)
+    # These trigger regardless of relative comparison
+    # BTC historical: normal ~40-60%, elevated ~80-100%, extreme >120%
+    vol_absolute_elevated: float = 0.04  # 4% daily std (~75% annualized)
+    vol_absolute_extreme: float = 0.06   # 6% daily std (~115% annualized)
+    use_absolute_vol: bool = True  # Enable absolute vol detection
+
+    # NEW: Historical percentile thresholds (0-1)
+    # Compare current vol to ALL available history, not just recent window
+    vol_percentile_elevated: float = 0.80  # Top 20% of historical vol
+    vol_percentile_extreme: float = 0.95   # Top 5% of historical vol
+    use_percentile_vol: bool = True  # Enable percentile-based detection
+
     # Price drop thresholds (percentage change over lookback)
     price_drop_lookback: int = 24  # hours
     price_drop_elevated: float = -0.05  # -5% in 24h triggers ELEVATED
     price_drop_extreme: float = -0.10   # -10% in 24h triggers EXTREME
+
+    # NEW: Drawdown from recent high
+    drawdown_lookback: int = 72  # 3 days
+    drawdown_elevated: float = -0.10   # -10% from 72h high
+    drawdown_extreme: float = -0.20    # -20% from 72h high
+    use_drawdown: bool = True
 
     # Funding rate thresholds (if available)
     funding_extreme_threshold: float = 0.001  # |0.1%| per 8h triggers EXTREME
@@ -115,8 +134,14 @@ class RegimePresets:
         return RegimeConfig(
             vol_elevated_threshold=1.3,
             vol_extreme_threshold=2.0,
+            vol_absolute_elevated=0.03,  # 3% daily std
+            vol_absolute_extreme=0.045,  # 4.5% daily std
+            vol_percentile_elevated=0.70,
+            vol_percentile_extreme=0.90,
             price_drop_elevated=-0.03,
             price_drop_extreme=-0.07,
+            drawdown_elevated=-0.07,
+            drawdown_extreme=-0.15,
             max_trades_per_day_elevated=5,
             max_trades_per_day_extreme=0,
             position_scale_elevated=0.3,
@@ -139,8 +164,14 @@ class RegimePresets:
         return RegimeConfig(
             vol_elevated_threshold=2.0,
             vol_extreme_threshold=3.0,
+            vol_absolute_elevated=0.05,  # 5% daily std
+            vol_absolute_extreme=0.08,   # 8% daily std
+            vol_percentile_elevated=0.90,
+            vol_percentile_extreme=0.98,
             price_drop_elevated=-0.07,
             price_drop_extreme=-0.15,
+            drawdown_elevated=-0.15,
+            drawdown_extreme=-0.30,
             max_trades_per_day_elevated=20,
             max_trades_per_day_extreme=5,
             position_scale_elevated=0.7,
@@ -610,6 +641,14 @@ def apply_regime_filter_vectorized(
     This is a faster implementation that pre-computes regime indicators
     for all timestamps, then applies thresholds vectorized.
 
+    Uses multiple detection methods:
+    1. Relative volatility ratio (current vs baseline)
+    2. Absolute volatility thresholds
+    3. Historical volatility percentiles
+    4. Price drops over lookback period
+    5. Drawdown from recent high
+    6. Extreme funding rates (if available)
+
     Trade count limits are NOT enforced in this version (for speed).
     Use apply_regime_filter_to_predictions for full functionality.
 
@@ -638,13 +677,31 @@ def apply_regime_filter_vectorized(
     # Compute log returns
     log_returns = np.log(prices / prices.shift(1))
 
-    # Compute rolling volatility
+    # 1. Compute rolling volatility and ratio
     current_vol = log_returns.rolling(window=cfg.vol_lookback, min_periods=cfg.vol_lookback).std()
     baseline_vol = log_returns.rolling(window=cfg.vol_baseline_lookback, min_periods=cfg.vol_baseline_lookback).std()
     vol_ratio = (current_vol / baseline_vol).fillna(1.0)
 
-    # Compute price change
+    # 2. Compute absolute volatility (already in current_vol, it's daily std of log returns)
+    abs_vol = current_vol.fillna(0.0)
+
+    # 3. Compute historical volatility percentile (expanding window)
+    # This compares current vol to ALL historical vol, not just recent
+    vol_percentile = current_vol.expanding(min_periods=720).apply(
+        lambda x: (x[:-1] < x.iloc[-1]).mean() if len(x) > 1 else 0.5,
+        raw=False
+    ).fillna(0.5)
+
+    # 4. Compute price change
     price_change = prices.pct_change(periods=cfg.price_drop_lookback).fillna(0.0)
+
+    # 5. Compute drawdown from recent high
+    if cfg.use_drawdown:
+        rolling_high = prices.rolling(window=cfg.drawdown_lookback, min_periods=1).max()
+        drawdown = (prices - rolling_high) / rolling_high
+        drawdown = drawdown.fillna(0.0)
+    else:
+        drawdown = pd.Series(0.0, index=prices.index)
 
     # Initialize regime as NORMAL
     result['regime'] = MarketRegime.NORMAL.value
@@ -653,24 +710,48 @@ def apply_regime_filter_vectorized(
     result['filter_reason'] = 'ALLOWED: normal regime'
 
     # Align indices - create mapping from prediction timestamps to price indices
-    # This handles cases where predictions and prices have different indices
-    try:
-        vol_ratio_aligned = vol_ratio.reindex(result['timestamp'], method='ffill').fillna(1.0)
-        price_change_aligned = price_change.reindex(result['timestamp'], method='ffill').fillna(0.0)
-    except Exception:
-        # Fallback: use position-based alignment
-        vol_ratio_aligned = vol_ratio.values[:len(result)] if len(vol_ratio) >= len(result) else \
-                           np.pad(vol_ratio.values, (0, len(result) - len(vol_ratio)), constant_values=1.0)
-        price_change_aligned = price_change.values[:len(result)] if len(price_change) >= len(result) else \
-                              np.pad(price_change.values, (0, len(result) - len(price_change)), constant_values=0.0)
-        vol_ratio_aligned = pd.Series(vol_ratio_aligned, index=result.index)
-        price_change_aligned = pd.Series(price_change_aligned, index=result.index)
+    def align_series(series, timestamps, default_value):
+        try:
+            aligned = series.reindex(timestamps, method='ffill').fillna(default_value)
+            return aligned
+        except Exception:
+            # Fallback: use position-based alignment
+            vals = series.values[:len(timestamps)] if len(series) >= len(timestamps) else \
+                   np.pad(series.values, (0, len(timestamps) - len(series)), constant_values=default_value)
+            return pd.Series(vals, index=result.index)
 
-    # Detect EXTREME regime
-    extreme_mask = (
-        (vol_ratio_aligned >= cfg.vol_extreme_threshold) |
-        (price_change_aligned <= cfg.price_drop_extreme)
-    )
+    vol_ratio_aligned = align_series(vol_ratio, result['timestamp'], 1.0)
+    abs_vol_aligned = align_series(abs_vol, result['timestamp'], 0.0)
+    vol_pctl_aligned = align_series(vol_percentile, result['timestamp'], 0.5)
+    price_change_aligned = align_series(price_change, result['timestamp'], 0.0)
+    drawdown_aligned = align_series(drawdown, result['timestamp'], 0.0)
+
+    # Build EXTREME detection mask (any of these conditions)
+    extreme_conditions = []
+
+    # Relative volatility ratio
+    extreme_conditions.append(vol_ratio_aligned >= cfg.vol_extreme_threshold)
+
+    # Absolute volatility
+    if cfg.use_absolute_vol:
+        extreme_conditions.append(abs_vol_aligned >= cfg.vol_absolute_extreme)
+
+    # Historical percentile
+    if cfg.use_percentile_vol:
+        extreme_conditions.append(vol_pctl_aligned >= cfg.vol_percentile_extreme)
+
+    # Price drop
+    extreme_conditions.append(price_change_aligned <= cfg.price_drop_extreme)
+
+    # Drawdown from high
+    if cfg.use_drawdown:
+        extreme_conditions.append(drawdown_aligned <= cfg.drawdown_extreme)
+
+    # Combine all extreme conditions with OR
+    extreme_mask = pd.Series(False, index=result.index)
+    for cond in extreme_conditions:
+        extreme_mask = extreme_mask | cond
+
     result.loc[extreme_mask, 'regime'] = MarketRegime.EXTREME.value
     result.loc[extreme_mask, 'position_scale'] = cfg.position_scale_extreme
     result.loc[extreme_mask, 'filter_reason'] = 'BLOCKED: extreme regime'
@@ -680,12 +761,34 @@ def apply_regime_filter_vectorized(
     result.loc[extreme_trade_mask, 'should_trade'] = False
     result.loc[extreme_trade_mask, 'regime_blocked'] = True
 
-    # Detect ELEVATED regime (where not already EXTREME)
-    elevated_mask = (
-        ~extreme_mask &
-        ((vol_ratio_aligned >= cfg.vol_elevated_threshold) |
-         (price_change_aligned <= cfg.price_drop_elevated))
-    )
+    # Build ELEVATED detection mask (where not already EXTREME)
+    elevated_conditions = []
+
+    # Relative volatility ratio
+    elevated_conditions.append(vol_ratio_aligned >= cfg.vol_elevated_threshold)
+
+    # Absolute volatility
+    if cfg.use_absolute_vol:
+        elevated_conditions.append(abs_vol_aligned >= cfg.vol_absolute_elevated)
+
+    # Historical percentile
+    if cfg.use_percentile_vol:
+        elevated_conditions.append(vol_pctl_aligned >= cfg.vol_percentile_elevated)
+
+    # Price drop
+    elevated_conditions.append(price_change_aligned <= cfg.price_drop_elevated)
+
+    # Drawdown from high
+    if cfg.use_drawdown:
+        elevated_conditions.append(drawdown_aligned <= cfg.drawdown_elevated)
+
+    # Combine all elevated conditions with OR
+    elevated_cond = pd.Series(False, index=result.index)
+    for cond in elevated_conditions:
+        elevated_cond = elevated_cond | cond
+
+    elevated_mask = ~extreme_mask & elevated_cond
+
     result.loc[elevated_mask, 'regime'] = MarketRegime.ELEVATED.value
     result.loc[elevated_mask, 'position_scale'] = cfg.position_scale_elevated
     result.loc[elevated_mask, 'filter_reason'] = 'ALLOWED: elevated regime, reduced position'
