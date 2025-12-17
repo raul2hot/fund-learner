@@ -222,6 +222,25 @@ def load_individual_seed_results(period_id: str) -> Dict[int, float]:
     results = {}
 
     for seed in SEEDS:
+        results[seed] = 0  # Default
+
+        # Try seed_summary.json first (structure: {"seed": X, "results": {period: {metrics: {...}}}})
+        summary_path = RESULTS_DIR / f"seed_{seed}" / "seed_summary.json"
+        if summary_path.exists():
+            try:
+                with open(summary_path) as f:
+                    data = json.load(f)
+                    if 'results' in data and period_id in data['results']:
+                        period_data = data['results'][period_id]
+                        if isinstance(period_data, dict) and 'metrics' in period_data:
+                            results[seed] = period_data['metrics'].get('total_return', 0)
+                        elif isinstance(period_data, dict):
+                            results[seed] = period_data.get('total_return', 0)
+                        continue
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Fallback: try test_results.json in period folder
         results_path = RESULTS_DIR / f"seed_{seed}" / period_id / "test_results.json"
         if results_path.exists():
             try:
@@ -229,9 +248,7 @@ def load_individual_seed_results(period_id: str) -> Dict[int, float]:
                     data = json.load(f)
                     results[seed] = data.get('total_return', 0)
             except (json.JSONDecodeError, KeyError):
-                results[seed] = 0
-        else:
-            results[seed] = 0
+                pass
 
     return results
 
