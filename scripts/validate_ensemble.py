@@ -285,6 +285,7 @@ def main():
     print("=" * 100)
     print(f"ENSEMBLE VALIDATION - {args.method.upper()} METHOD")
     print("=" * 100)
+    print(f"Strategy: Deploy period_5_full models with fixed crash-resistant weights")
     print(f"Stop-loss: {args.stop_loss * 100:.1f}%")
     if args.method == 'weighted':
         print(f"Weight by: {args.weight_by} (temperature={args.temperature})")
@@ -339,13 +340,15 @@ def main():
         print("-" * 80)
 
         try:
-            # Create ensemble for this period
-            print(f"  Creating {args.method} ensemble...")
+            # Create ensemble using period_5_full models for ALL test periods
+            # This simulates: "Deploy the final trained ensemble and test historically"
+            # The weights are fixed based on May 2021 crash performance
+            print(f"  Creating {args.method} ensemble (using period_5_full models)...")
             ensemble = create_ensemble_from_walk_forward(
                 RESULTS_DIR,
                 method=method,
-                period=period_id,
-                weight_by_period=args.weight_by,
+                period="period_5_full",  # Always use final models
+                weight_by_period=args.weight_by,  # Weight by crash performance
                 seeds=SEEDS,
                 device=device,
                 temperature=args.temperature
