@@ -74,6 +74,12 @@ class EnsembleConfig:
     # When models disagree (low agreement), averaging produces confused signals
     # that are wrong more often than any individual model
     agreement_threshold: float = 0.0  # 0.0 = disabled, 0.7 = require 70% agreement
+    # Dynamic agreement threshold based on volatility
+    # During high volatility (crisis), require more model agreement
+    dynamic_agreement_threshold: bool = False  # Enable volatility-based threshold
+    agreement_threshold_normal: float = 0.70   # Normal mode threshold
+    agreement_threshold_crisis: float = 0.95   # Crisis mode threshold
+    crisis_volatility_percentile: float = 0.90 # Volatility percentile for crisis mode
 
     def __post_init__(self):
         if self.weights is None:
@@ -443,7 +449,26 @@ class EnsemblePredictor:
         # When models disagree (low agreement), averaging produces confused signals
         # Only trade when sufficient models agree on the direction
         agreement_filtered = torch.zeros_like(should_trade_initial)
-        if self.config.agreement_threshold > 0:
+
+        # Determine agreement threshold - static or dynamic based on volatility
+        if self.config.dynamic_agreement_threshold and volatility is not None:
+            # Dynamic threshold: higher volatility → require more agreement
+            # Compute per-sample threshold based on volatility percentile
+            vol_thresh = torch.quantile(volatility, self.config.crisis_volatility_percentile)
+            is_crisis = volatility > vol_thresh
+
+            # Create per-sample threshold tensor
+            effective_threshold = torch.where(
+                is_crisis,
+                torch.tensor(self.config.agreement_threshold_crisis, device=self.device),
+                torch.tensor(self.config.agreement_threshold_normal, device=self.device)
+            )
+
+            # Apply per-sample threshold
+            low_agreement = direction_agreement < effective_threshold
+            agreement_filtered = low_agreement & should_trade_initial
+            should_trade = should_trade_initial & ~low_agreement
+        elif self.config.agreement_threshold > 0:
             low_agreement = direction_agreement < self.config.agreement_threshold
             agreement_filtered = low_agreement & should_trade_initial
             should_trade = should_trade_initial & ~low_agreement
@@ -725,7 +750,11 @@ def create_ensemble_from_walk_forward(
     seeds: List[int] = None,
     device: str = None,
     temperature: float = 2.0,
-    agreement_threshold: float = 0.0
+    agreement_threshold: float = 0.0,
+    dynamic_agreement_threshold: bool = False,
+    agreement_threshold_normal: float = 0.70,
+    agreement_threshold_crisis: float = 0.95,
+    crisis_volatility_percentile: float = 0.90
 ) -> EnsemblePredictor:
     """
     Create an ensemble from walk-forward validation results.
@@ -742,6 +771,10 @@ def create_ensemble_from_walk_forward(
         temperature: Temperature for performance weighting softmax
         agreement_threshold: Min fraction of models that must agree on direction
                             to execute a trade (0.0 = disabled, 0.7 = require 70%)
+        dynamic_agreement_threshold: Enable volatility-based dynamic threshold
+        agreement_threshold_normal: Threshold during normal volatility (default: 0.70)
+        agreement_threshold_crisis: Threshold during crisis/high volatility (default: 0.95)
+        crisis_volatility_percentile: Volatility percentile to trigger crisis mode (default: 0.90)
 
     Returns:
         Configured EnsemblePredictor
@@ -783,7 +816,14 @@ def create_ensemble_from_walk_forward(
                 weight_returns[seed] = 0.0
                 logger.warning(f"Seed {seed}: No results for {weight_by_period}, using weight=0")
 
-        config = EnsembleConfig(method=method, agreement_threshold=agreement_threshold)
+        config = EnsembleConfig(
+            method=method,
+            agreement_threshold=agreement_threshold,
+            dynamic_agreement_threshold=dynamic_agreement_threshold,
+            agreement_threshold_normal=agreement_threshold_normal,
+            agreement_threshold_crisis=agreement_threshold_crisis,
+            crisis_volatility_percentile=crisis_volatility_percentile
+        )
         ensemble = PerformanceWeightedEnsemble(
             loader.loaded_models,
             weight_returns,
@@ -791,7 +831,14 @@ def create_ensemble_from_walk_forward(
             temperature=temperature
         )
     else:
-        config = EnsembleConfig(method=method, agreement_threshold=agreement_threshold)
+        config = EnsembleConfig(
+            method=method,
+            agreement_threshold=agreement_threshold,
+            dynamic_agreement_threshold=dynamic_agreement_threshold,
+            agreement_threshold_normal=agreement_threshold_normal,
+            agreement_threshold_crisis=agreement_threshold_crisis,
+            crisis_volatility_percentile=crisis_volatility_percentile
+        )
         ensemble = EnsemblePredictor(loader.loaded_models, config)
 
     return ensemble
