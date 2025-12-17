@@ -79,6 +79,21 @@ PERIODS = [
 ]
 
 
+def get_weight_period(test_period: str) -> Optional[str]:
+    """
+    Get appropriate weighting period (must be BEFORE test period).
+
+    For true walk-forward validation, we can only use performance data
+    from periods that occurred BEFORE the test period.
+    """
+    # Can't weight by future data - use equal weights for early periods
+    if test_period in ['period_0_covid', 'period_1_may2021']:
+        return None  # Use equal weights
+    # For all other periods, weight by May 2021 crash performance
+    # This is the first major crash with enough data to assess model robustness
+    return 'period_1_may2021'
+
+
 def load_raw_data() -> pd.DataFrame:
     """Load raw price dataset."""
     logger.info(f"Loading data from {DATA_PATH}")
@@ -285,10 +300,11 @@ def main():
     print("=" * 100)
     print(f"ENSEMBLE VALIDATION - {args.method.upper()} METHOD")
     print("=" * 100)
-    print(f"Strategy: Deploy period_5_full models with fixed crash-resistant weights")
+    print(f"Strategy: Walk-forward validation using period-appropriate models (no look-ahead bias)")
     print(f"Stop-loss: {args.stop_loss * 100:.1f}%")
     if args.method == 'weighted':
-        print(f"Weight by: {args.weight_by} (temperature={args.temperature})")
+        print(f"Default weight by: {args.weight_by} (temperature={args.temperature})")
+        print(f"Note: Early periods use equal weights (no prior crash data available)")
     print()
 
     # Check if results directory exists
@@ -340,15 +356,21 @@ def main():
         print("-" * 80)
 
         try:
-            # Create ensemble using period_5_full models for ALL test periods
-            # This simulates: "Deploy the final trained ensemble and test historically"
-            # The weights are fixed based on May 2021 crash performance
-            print(f"  Creating {args.method} ensemble (using period_5_full models)...")
+            # Create ensemble using period-appropriate models (walk-forward validation)
+            # Uses models trained BEFORE each test period to avoid look-ahead bias
+            weight_period = get_weight_period(period_id)
+            effective_method = method if weight_period else EnsembleMethod.MEAN
+
+            if weight_period:
+                print(f"  Creating {args.method} ensemble (models={period_id}, weights={weight_period})...")
+            else:
+                print(f"  Creating MEAN ensemble (models={period_id}, no prior crash data for weighting)...")
+
             ensemble = create_ensemble_from_walk_forward(
                 RESULTS_DIR,
-                method=method,
-                period="period_5_full",  # Always use final models
-                weight_by_period=args.weight_by,  # Weight by crash performance
+                method=effective_method,
+                period=period_id,  # Use period-appropriate models (no look-ahead bias)
+                weight_by_period=weight_period,  # Weight by prior crash performance (or None)
                 seeds=SEEDS,
                 device=device,
                 temperature=args.temperature
