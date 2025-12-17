@@ -309,7 +309,21 @@ def main():
                         help='Disable regime filter')
     parser.add_argument('--agreement-threshold', type=float, default=0.0,
                         help='Min model agreement to trade (0.0=disabled, 0.7=require 70%% agreement)')
+    parser.add_argument('--single-seed', type=int, default=None,
+                        help='DIAGNOSTIC: Run with only one seed to verify calculation parity')
     args = parser.parse_args()
+
+    # Handle single-seed diagnostic mode
+    if args.single_seed is not None:
+        print("=" * 100)
+        print(f"DIAGNOSTIC MODE: Single-seed ensemble (seed={args.single_seed})")
+        print("=" * 100)
+        print("Purpose: Verify that ensemble calculation matches individual seed methodology")
+        print("Expected: Single-seed ensemble return should equal saved individual return")
+        print()
+        # Override to use only the specified seed
+        global SEEDS
+        SEEDS = [args.single_seed]
 
     # Map method string to enum
     method_map = {
@@ -484,6 +498,32 @@ def main():
                     ret = individual_returns[seed]
                     weight = ensemble.config.weights.get(seed, 0)
                     print(f"    Seed {seed}: {ret:>+8.2f}% (weight={weight:.3f})")
+
+            # DIAGNOSTIC: Single-seed comparison
+            if args.single_seed is not None:
+                saved_return = individual_returns.get(args.single_seed, 0)
+                ensemble_return = ensemble_metrics['total_return']
+                diff = abs(ensemble_return - saved_return)
+
+                print(f"\n  {'='*60}")
+                print(f"  DIAGNOSTIC: Single-seed calculation parity check")
+                print(f"  {'='*60}")
+                print(f"  Saved individual result:    {saved_return:>+10.2f}%")
+                print(f"  Single-seed ensemble:       {ensemble_return:>+10.2f}%")
+                print(f"  Difference:                 {diff:>10.2f}%")
+
+                if diff < 0.1:
+                    print(f"  Status: ✓ MATCH - Calculations are equivalent")
+                elif diff < 1.0:
+                    print(f"  Status: ~ CLOSE - Minor difference (likely rounding)")
+                else:
+                    print(f"  Status: ✗ MISMATCH - Calculation methodologies differ!")
+                    print(f"  ")
+                    print(f"  Possible causes:")
+                    print(f"    1. Different return formula (open-to-close vs close-to-close)")
+                    print(f"    2. Different stop-loss application (MAE vs simple clip)")
+                    print(f"    3. Different regime filtering")
+                    print(f"    4. Different trade threshold or timing")
 
             all_results.append({
                 'period_id': period_id,
