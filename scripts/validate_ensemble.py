@@ -214,6 +214,11 @@ def evaluate_ensemble_on_period(
     metrics['avg_confidence'] = predictions['confidence'].mean()
     metrics['trade_rate'] = predictions['should_trade'].mean() * 100
 
+    # Add volatility filtering stats
+    if 'volatility_filtered' in predictions.columns:
+        metrics['n_volatility_filtered'] = int(predictions['volatility_filtered'].sum())
+        metrics['pct_volatility_filtered'] = predictions['volatility_filtered'].mean() * 100
+
     return metrics
 
 
@@ -264,8 +269,8 @@ def main():
                         help='Specific period to evaluate (default: all)')
     parser.add_argument('--weight-by', type=str, default='period_1_may2021',
                         help='Period to use for performance weighting')
-    parser.add_argument('--temperature', type=float, default=0.5,
-                        help='Temperature for weighted ensemble softmax')
+    parser.add_argument('--temperature', type=float, default=2.0,
+                        help='Temperature for weighted ensemble softmax (higher = more uniform weights)')
     args = parser.parse_args()
 
     # Map method string to enum
@@ -399,6 +404,9 @@ def main():
                   f"Sharpe: {ensemble_metrics['sharpe']:.2f}, "
                   f"Win rate: {ensemble_metrics['win_rate']:.1f}%")
             print(f"  Model agreement: {ensemble_metrics['avg_agreement']:.1%}")
+            if 'n_volatility_filtered' in ensemble_metrics:
+                print(f"  Volatility filtered: {ensemble_metrics['n_volatility_filtered']} "
+                      f"({ensemble_metrics['pct_volatility_filtered']:.1f}%)")
 
             # Individual seed returns
             if any(individual_returns.values()):

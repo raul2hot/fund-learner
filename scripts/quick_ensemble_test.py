@@ -123,7 +123,7 @@ def test_with_real_models():
     weighted_ensemble = PerformanceWeightedEnsemble(
         loader.loaded_models,
         available_returns,
-        temperature=0.5
+        temperature=2.0  # Default: gives best performer ~2-3x weight
     )
 
     result = weighted_ensemble.predict(prices, features)
@@ -216,7 +216,7 @@ def test_with_synthetic_models():
     weighted_ensemble = PerformanceWeightedEnsemble(
         models,
         MAY2021_RETURNS,
-        temperature=0.5
+        temperature=2.0  # Default: gives best performer ~2-3x weight
     )
 
     result = weighted_ensemble.predict(prices, features)
