@@ -67,6 +67,9 @@ class EnsembleConfig:
     normalize_predictions: bool = True  # Normalize before combining
     trade_threshold: float = 0.55  # From calibrated model
     stop_loss_pct: float = -0.02  # -2.0% stop-loss
+    # Volatility filtering (matches CalibratedTwoStageModel)
+    filter_high_volatility: bool = True  # Filter trades during high volatility
+    vol_high_threshold: float = 0.66  # 66th percentile = high volatility regime
 
     def __post_init__(self):
         if self.weights is None:
@@ -309,6 +312,7 @@ class EnsemblePredictor:
         self,
         prices: torch.Tensor,
         features: torch.Tensor,
+        volatility: torch.Tensor = None,
         return_individual: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
@@ -317,6 +321,7 @@ class EnsemblePredictor:
         Args:
             prices: [batch, window_size, n_price_features]
             features: [batch, window_size, n_engineered_features]
+            volatility: [batch] optional volatility values for regime filtering
             return_individual: If True, also return individual model predictions
 
         Returns:
@@ -329,10 +334,13 @@ class EnsemblePredictor:
             - 'should_trade': Trade signal based on threshold [batch]
             - 'confidence': Ensemble confidence [batch]
             - 'agreement': Fraction of models agreeing [batch]
+            - 'volatility_filtered': [batch] bool - True if filtered by volatility
             - 'individual_predictions': (optional) Dict of per-seed predictions
         """
         prices = prices.to(self.device)
         features = features.to(self.device)
+        if volatility is not None:
+            volatility = volatility.to(self.device)
 
         # Collect predictions from all models
         all_tradeable_logits = []
@@ -409,6 +417,21 @@ class EnsemblePredictor:
         should_trade = tradeable_prob >= self.config.trade_threshold
         is_long = long_prob > 0.5
 
+        # Volatility regime filtering (matches CalibratedTwoStageModel)
+        batch_size = prices.shape[0]
+        volatility_filtered = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        if self.config.filter_high_volatility and volatility is not None:
+            # Use configurable percentile as high volatility threshold
+            vol_thresh = torch.quantile(volatility, self.config.vol_high_threshold)
+            is_high_vol = volatility > vol_thresh
+
+            # Track which trades would be filtered
+            volatility_filtered = is_high_vol & should_trade
+
+            # Filter out trades during high volatility
+            should_trade = should_trade & ~is_high_vol
+
         # Calculate agreement (how many models agree with ensemble decision)
         individual_should_trade = F.softmax(stacked_tradeable, dim=-1)[:, :, 1] >= self.config.trade_threshold
         individual_is_long = F.softmax(stacked_direction, dim=-1)[:, :, 0] > 0.5
@@ -438,6 +461,7 @@ class EnsemblePredictor:
             'agreement': agreement,
             'trade_agreement': trade_agreement,
             'direction_agreement': direction_agreement,
+            'volatility_filtered': volatility_filtered,
         }
 
         if return_individual:
@@ -534,6 +558,13 @@ class PerformanceWeightedEnsemble(EnsemblePredictor):
     This is particularly useful when some seeds learned crash-resistant
     features (like seed 1337) while others didn't.
 
+    Weight Calculation:
+        Uses z-score normalization followed by softmax to convert returns
+        into weights. This ensures:
+        1. All models contribute meaningfully (no zero weights)
+        2. Better performers get 2-3x weight, not 100x
+        3. The weighting is statistically principled
+
     Usage:
         # Weight by May 2021 performance (crash resistance)
         validation_returns = {
@@ -547,7 +578,7 @@ class PerformanceWeightedEnsemble(EnsemblePredictor):
         ensemble = PerformanceWeightedEnsemble(
             models,
             validation_returns,
-            temperature=0.5  # Lower = more weight to best performer
+            temperature=2.0  # Controls weight concentration (higher = more uniform)
         )
     """
 
@@ -556,7 +587,7 @@ class PerformanceWeightedEnsemble(EnsemblePredictor):
         models: Dict[int, nn.Module],
         validation_returns: Dict[int, float],
         config: Optional[EnsembleConfig] = None,
-        temperature: float = 0.5
+        temperature: float = 2.0
     ):
         """
         Args:
@@ -564,17 +595,28 @@ class PerformanceWeightedEnsemble(EnsemblePredictor):
             validation_returns: Dictionary mapping seed -> validation return (%)
             config: Ensemble configuration
             temperature: Softmax temperature for weight calculation
-                        Lower = more weight to best performer
+                        Higher = more uniform weights
+                        Lower = more concentrated on best performer
+                        Recommended: 2.0 (gives best performer ~2-3x weight of worst)
         """
         # Calculate weights from validation performance
         seeds = list(models.keys())
         returns = np.array([validation_returns.get(seed, 0) for seed in seeds])
 
-        # Shift returns to positive range
-        shifted_returns = returns - returns.min() + 1.0
+        # Z-score normalize returns to handle different scales
+        # This ensures the softmax operates on a standardized scale
+        mean_return = np.mean(returns)
+        std_return = np.std(returns)
+        if std_return > 0:
+            z_returns = (returns - mean_return) / std_return
+        else:
+            # All returns equal - use uniform weights
+            z_returns = np.zeros_like(returns)
 
-        # Apply softmax with temperature
-        exp_returns = np.exp(shifted_returns / temperature)
+        # Apply softmax with temperature to normalized returns
+        # Temperature=2.0 with z-scores gives reasonable weight spread:
+        # Best performer gets ~2-3x the weight of worst performer
+        exp_returns = np.exp(z_returns / temperature)
         weights = exp_returns / exp_returns.sum()
 
         # Create weights dict
@@ -590,6 +632,7 @@ class PerformanceWeightedEnsemble(EnsemblePredictor):
 
         # Log weight distribution
         logger.info("Performance-weighted ensemble initialized:")
+        logger.info(f"  Returns: mean={mean_return:.2f}%, std={std_return:.2f}%")
         for seed in sorted(seeds):
             ret = validation_returns.get(seed, 0)
             w = weight_dict[seed]
@@ -661,7 +704,7 @@ def create_ensemble_from_walk_forward(
     weight_by_period: str = "period_1_may2021",
     seeds: List[int] = None,
     device: str = None,
-    temperature: float = 0.5
+    temperature: float = 2.0
 ) -> EnsemblePredictor:
     """
     Create an ensemble from walk-forward validation results.
@@ -806,8 +849,16 @@ def ensemble_predict_dataframe(
         prices_tensor = torch.tensor(np.array(batch_prices), dtype=torch.float32, device=device)
         features_tensor = torch.tensor(np.array(batch_features), dtype=torch.float32, device=device)
 
-        # Get predictions
-        result = ensemble.predict(prices_tensor, features_tensor, return_individual=return_individual)
+        # Compute volatility from features (matches CalibratedTwoStageModel)
+        # Volatility = std of features at the last timestep across all features
+        volatility = features_tensor[:, -1, :].std(dim=-1)
+
+        # Get predictions with volatility filtering
+        result = ensemble.predict(
+            prices_tensor, features_tensor,
+            volatility=volatility,
+            return_individual=return_individual
+        )
 
         # Store results
         for j in range(end_idx - start_idx):
@@ -820,6 +871,7 @@ def ensemble_predict_dataframe(
                 'long_prob': result['long_prob'][j].item(),
                 'confidence': result['confidence'][j].item(),
                 'agreement': result['agreement'][j].item(),
+                'volatility_filtered': result['volatility_filtered'][j].item(),
             }
 
             # Add individual predictions if requested
