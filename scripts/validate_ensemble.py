@@ -318,6 +318,14 @@ def main():
                         help='Disable regime filter')
     parser.add_argument('--agreement-threshold', type=float, default=0.0,
                         help='Min model agreement to trade (0.0=disabled, 0.7=require 70%% agreement)')
+    parser.add_argument('--dynamic-agreement', action='store_true', default=False,
+                        help='Enable dynamic agreement threshold based on volatility')
+    parser.add_argument('--threshold-normal', type=float, default=0.70,
+                        help='Agreement threshold for normal volatility (default: 0.70)')
+    parser.add_argument('--threshold-crisis', type=float, default=0.95,
+                        help='Agreement threshold for high volatility/crisis (default: 0.95)')
+    parser.add_argument('--crisis-percentile', type=float, default=0.90,
+                        help='Volatility percentile to trigger crisis mode (default: 0.90)')
     parser.add_argument('--single-seed', type=int, default=None,
                         help='DIAGNOSTIC: Run with only one seed to verify calculation parity')
     args = parser.parse_args()
@@ -350,7 +358,10 @@ def main():
     print(f"Methodology: Open-to-close returns with MAE-aware stop-loss (same as individual seeds)")
     print(f"Stop-loss: {args.stop_loss * 100:.1f}% (MAE-aware)")
     print(f"Regime filter: {'ENABLED (moderate)' if args.regime_filter else 'DISABLED'}")
-    if args.agreement_threshold > 0:
+    if args.dynamic_agreement:
+        print(f"Agreement threshold: DYNAMIC (normal={args.threshold_normal:.0%}, crisis={args.threshold_crisis:.0%})")
+        print(f"  Crisis mode triggers when volatility > {args.crisis_percentile:.0%} percentile")
+    elif args.agreement_threshold > 0:
         print(f"Agreement threshold: {args.agreement_threshold:.0%} (only trade when models agree)")
     else:
         print(f"Agreement threshold: DISABLED (trade even when models disagree)")
@@ -426,7 +437,11 @@ def main():
                 seeds=SEEDS,
                 device=device,
                 temperature=args.temperature,
-                agreement_threshold=args.agreement_threshold
+                agreement_threshold=args.agreement_threshold,
+                dynamic_agreement_threshold=args.dynamic_agreement,
+                agreement_threshold_normal=args.threshold_normal,
+                agreement_threshold_crisis=args.threshold_crisis,
+                crisis_volatility_percentile=args.crisis_percentile
             )
 
             # Prepare period data with proper feature computation
