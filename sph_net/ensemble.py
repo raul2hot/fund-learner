@@ -70,6 +70,10 @@ class EnsembleConfig:
     # Volatility filtering (matches CalibratedTwoStageModel)
     filter_high_volatility: bool = True  # Filter trades during high volatility
     vol_high_threshold: float = 0.66  # 66th percentile = high volatility regime
+    # Agreement threshold: Only trade when models agree
+    # When models disagree (low agreement), averaging produces confused signals
+    # that are wrong more often than any individual model
+    agreement_threshold: float = 0.0  # 0.0 = disabled, 0.7 = require 70% agreement
 
     def __post_init__(self):
         if self.weights is None:
@@ -413,9 +417,38 @@ class EnsemblePredictor:
         tradeable_prob = tradeable_probs[:, 1]  # P(trade)
         long_prob = direction_probs[:, 0]  # P(long)
 
-        # Trade decisions
-        should_trade = tradeable_prob >= self.config.trade_threshold
+        # Trade decisions - initial pass
+        should_trade_initial = tradeable_prob >= self.config.trade_threshold
         is_long = long_prob > 0.5
+
+        # Calculate agreement BEFORE filtering
+        # This is critical: we need to know model consensus before deciding to trade
+        individual_should_trade = F.softmax(stacked_tradeable, dim=-1)[:, :, 1] >= self.config.trade_threshold
+        individual_is_long = F.softmax(stacked_direction, dim=-1)[:, :, 0] > 0.5
+
+        # Direction agreement: fraction of models that agree with ensemble direction
+        direction_agreement = (individual_is_long == is_long.unsqueeze(0)).float().mean(dim=0)
+
+        # Trade agreement: fraction of models that agree with ensemble trade decision
+        trade_agreement = (individual_should_trade == should_trade_initial.unsqueeze(0)).float().mean(dim=0)
+
+        # Combined agreement (for trades: agree on both trade and direction)
+        agreement = torch.where(
+            should_trade_initial,
+            trade_agreement * direction_agreement,
+            trade_agreement
+        )
+
+        # Apply agreement threshold filter
+        # When models disagree (low agreement), averaging produces confused signals
+        # Only trade when sufficient models agree on the direction
+        agreement_filtered = torch.zeros_like(should_trade_initial)
+        if self.config.agreement_threshold > 0:
+            low_agreement = direction_agreement < self.config.agreement_threshold
+            agreement_filtered = low_agreement & should_trade_initial
+            should_trade = should_trade_initial & ~low_agreement
+        else:
+            should_trade = should_trade_initial
 
         # Volatility regime filtering (matches CalibratedTwoStageModel)
         batch_size = prices.shape[0]
@@ -431,20 +464,6 @@ class EnsemblePredictor:
 
             # Filter out trades during high volatility
             should_trade = should_trade & ~is_high_vol
-
-        # Calculate agreement (how many models agree with ensemble decision)
-        individual_should_trade = F.softmax(stacked_tradeable, dim=-1)[:, :, 1] >= self.config.trade_threshold
-        individual_is_long = F.softmax(stacked_direction, dim=-1)[:, :, 0] > 0.5
-
-        trade_agreement = (individual_should_trade == should_trade.unsqueeze(0)).float().mean(dim=0)
-        direction_agreement = (individual_is_long == is_long.unsqueeze(0)).float().mean(dim=0)
-
-        # Combined agreement (for trades: agree on both trade and direction)
-        agreement = torch.where(
-            should_trade,
-            trade_agreement * direction_agreement,
-            trade_agreement
-        )
 
         # Confidence = trade probability * agreement
         confidence = tradeable_prob * agreement
@@ -462,6 +481,7 @@ class EnsemblePredictor:
             'trade_agreement': trade_agreement,
             'direction_agreement': direction_agreement,
             'volatility_filtered': volatility_filtered,
+            'agreement_filtered': agreement_filtered,  # Trades blocked due to low model agreement
         }
 
         if return_individual:
@@ -704,7 +724,8 @@ def create_ensemble_from_walk_forward(
     weight_by_period: str = "period_1_may2021",
     seeds: List[int] = None,
     device: str = None,
-    temperature: float = 2.0
+    temperature: float = 2.0,
+    agreement_threshold: float = 0.0
 ) -> EnsemblePredictor:
     """
     Create an ensemble from walk-forward validation results.
@@ -719,6 +740,8 @@ def create_ensemble_from_walk_forward(
         seeds: Seeds to include (default: [42, 123, 456, 789, 1337])
         device: Device to load models on (auto-detect if None)
         temperature: Temperature for performance weighting softmax
+        agreement_threshold: Min fraction of models that must agree on direction
+                            to execute a trade (0.0 = disabled, 0.7 = require 70%)
 
     Returns:
         Configured EnsemblePredictor
@@ -760,13 +783,15 @@ def create_ensemble_from_walk_forward(
                 weight_returns[seed] = 0.0
                 logger.warning(f"Seed {seed}: No results for {weight_by_period}, using weight=0")
 
+        config = EnsembleConfig(method=method, agreement_threshold=agreement_threshold)
         ensemble = PerformanceWeightedEnsemble(
             loader.loaded_models,
             weight_returns,
+            config=config,
             temperature=temperature
         )
     else:
-        config = EnsembleConfig(method=method)
+        config = EnsembleConfig(method=method, agreement_threshold=agreement_threshold)
         ensemble = EnsemblePredictor(loader.loaded_models, config)
 
     return ensemble
@@ -872,6 +897,7 @@ def ensemble_predict_dataframe(
                 'confidence': result['confidence'][j].item(),
                 'agreement': result['agreement'][j].item(),
                 'volatility_filtered': result['volatility_filtered'][j].item(),
+                'agreement_filtered': result['agreement_filtered'][j].item(),
             }
 
             # Add individual predictions if requested
