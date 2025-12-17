@@ -70,28 +70,28 @@ class RegimeConfig:
     vol_elevated_threshold: float = 1.5  # 1.5x normal vol triggers ELEVATED
     vol_extreme_threshold: float = 2.5   # 2.5x normal vol triggers EXTREME
 
-    # NEW: Absolute volatility thresholds (annualized %)
-    # These trigger regardless of relative comparison
-    # BTC historical: normal ~40-60%, elevated ~80-100%, extreme >120%
-    vol_absolute_elevated: float = 0.04  # 4% daily std (~75% annualized)
-    vol_absolute_extreme: float = 0.06   # 6% daily std (~115% annualized)
+    # NEW: Absolute volatility thresholds (hourly log return std)
+    # BTC historical: normal ~1-1.5%, elevated ~2%, extreme >2.5%
+    # Note: These are HOURLY std, not daily!
+    vol_absolute_elevated: float = 0.02  # 2% hourly std
+    vol_absolute_extreme: float = 0.03   # 3% hourly std
     use_absolute_vol: bool = True  # Enable absolute vol detection
 
     # NEW: Historical percentile thresholds (0-1)
     # Compare current vol to ALL available history, not just recent window
-    vol_percentile_elevated: float = 0.80  # Top 20% of historical vol
-    vol_percentile_extreme: float = 0.95   # Top 5% of historical vol
+    vol_percentile_elevated: float = 0.75  # Top 25% of historical vol
+    vol_percentile_extreme: float = 0.90   # Top 10% of historical vol
     use_percentile_vol: bool = True  # Enable percentile-based detection
 
     # Price drop thresholds (percentage change over lookback)
     price_drop_lookback: int = 24  # hours
-    price_drop_elevated: float = -0.05  # -5% in 24h triggers ELEVATED
-    price_drop_extreme: float = -0.10   # -10% in 24h triggers EXTREME
+    price_drop_elevated: float = -0.03  # -3% in 24h triggers ELEVATED
+    price_drop_extreme: float = -0.07   # -7% in 24h triggers EXTREME
 
     # NEW: Drawdown from recent high
     drawdown_lookback: int = 72  # 3 days
-    drawdown_elevated: float = -0.10   # -10% from 72h high
-    drawdown_extreme: float = -0.20    # -20% from 72h high
+    drawdown_elevated: float = -0.07   # -7% from 72h high
+    drawdown_extreme: float = -0.12    # -12% from 72h high
     use_drawdown: bool = True
 
     # Funding rate thresholds (if available)
