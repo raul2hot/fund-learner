@@ -68,8 +68,9 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION - FROZEN (DO NOT MODIFY BETWEEN PERIODS)
 # =============================================================================
 
-# Random seed for reproducibility - FROZEN
-SEED = 42
+# Multiple seeds for robust evaluation (best practice: 3-5 seeds)
+# This measures model stability and gives confidence intervals
+SEEDS = [42, 123, 456, 789, 1337]
 
 DATA_PATH = Path("data_pipleine/ml_data/BTCUSDT_ml_data.parquet")
 OUTPUT_DIR = Path("experiments/walk_forward")
@@ -736,52 +737,282 @@ def print_summary(summary: Dict):
 
 
 # =============================================================================
+# MULTI-SEED AGGREGATION
+# =============================================================================
+
+def aggregate_multi_seed_results(all_seed_results: Dict[int, Dict]) -> Dict:
+    """
+    Aggregate results across multiple seeds to compute mean ± std.
+
+    This provides confidence intervals on model performance and measures
+    stability/robustness of the model to random initialization.
+    """
+    # Collect metrics per period across all seeds
+    period_metrics = {}
+
+    for seed, seed_results in all_seed_results.items():
+        for period_id, period_data in seed_results.items():
+            if period_id not in period_metrics:
+                period_metrics[period_id] = {
+                    'name': period_data['name'],
+                    'is_primary': period_data['is_primary'],
+                    'total_return': [],
+                    'total_return_no_sl': [],
+                    'sharpe_ratio': [],
+                    'win_rate': [],
+                    'n_trades': [],
+                }
+            m = period_data['metrics']
+            period_metrics[period_id]['total_return'].append(m.get('total_return', 0))
+            period_metrics[period_id]['total_return_no_sl'].append(m.get('total_return_no_sl', m.get('total_return', 0)))
+            period_metrics[period_id]['sharpe_ratio'].append(m.get('sharpe_ratio', 0))
+            period_metrics[period_id]['win_rate'].append(m.get('win_rate', 0))
+            period_metrics[period_id]['n_trades'].append(m.get('n_trades', 0))
+
+    # Compute mean ± std for each period
+    aggregated = {}
+    for period_id, metrics in period_metrics.items():
+        aggregated[period_id] = {
+            'name': metrics['name'],
+            'is_primary': metrics['is_primary'],
+            'metrics': {
+                'total_return_mean': float(np.mean(metrics['total_return'])),
+                'total_return_std': float(np.std(metrics['total_return'])),
+                'total_return_no_sl_mean': float(np.mean(metrics['total_return_no_sl'])),
+                'total_return_no_sl_std': float(np.std(metrics['total_return_no_sl'])),
+                'sharpe_ratio_mean': float(np.mean(metrics['sharpe_ratio'])),
+                'sharpe_ratio_std': float(np.std(metrics['sharpe_ratio'])),
+                'win_rate_mean': float(np.mean(metrics['win_rate'])),
+                'win_rate_std': float(np.std(metrics['win_rate'])),
+                'n_trades_mean': float(np.mean(metrics['n_trades'])),
+                'n_trades_std': float(np.std(metrics['n_trades'])),
+                # Raw values for detailed analysis
+                'total_return_all': metrics['total_return'],
+                'sharpe_ratio_all': metrics['sharpe_ratio'],
+            }
+        }
+
+    return aggregated
+
+
+def generate_multi_seed_summary(aggregated_results: Dict, seeds_used: list, output_dir: Path) -> Dict:
+    """Generate summary report for multi-seed evaluation."""
+
+    primary_ids = ['period_1_may2021', 'period_2_luna', 'period_3_ftx', 'period_4_etf', 'period_5_full']
+
+    # Collect primary period metrics
+    primary_return_means = []
+    primary_return_stds = []
+    primary_sharpe_means = []
+    primary_sharpe_stds = []
+
+    for pid in primary_ids:
+        if pid in aggregated_results:
+            m = aggregated_results[pid]['metrics']
+            primary_return_means.append(m['total_return_mean'])
+            primary_return_stds.append(m['total_return_std'])
+            primary_sharpe_means.append(m['sharpe_ratio_mean'])
+            primary_sharpe_stds.append(m['sharpe_ratio_std'])
+
+    # Compute aggregated statistics
+    avg_return_mean = np.mean(primary_return_means) if primary_return_means else 0
+    avg_return_std = np.mean(primary_return_stds) if primary_return_stds else 0  # Average of individual stds
+    avg_sharpe_mean = np.mean(primary_sharpe_means) if primary_sharpe_means else 0
+    avg_sharpe_std = np.mean(primary_sharpe_stds) if primary_sharpe_stds else 0
+
+    # Count periods profitable on average
+    n_profitable = sum(1 for r in primary_return_means if r > 0)
+
+    # Worst/best period (using means)
+    worst_return = min(primary_return_means) if primary_return_means else 0
+    best_return = max(primary_return_means) if primary_return_means else 0
+
+    # Compute stability score (lower std = more stable)
+    avg_stability = np.mean(primary_return_stds) if primary_return_stds else 0
+
+    # Compute verdict with stability consideration
+    verdict = compute_multi_seed_verdict(n_profitable, avg_return_mean, avg_sharpe_mean,
+                                          worst_return, avg_stability, len(seeds_used))
+
+    summary = {
+        'generated_at': datetime.now().isoformat(),
+        'evaluation_type': 'multi_seed',
+        'seeds_used': seeds_used,
+        'n_seeds': len(seeds_used),
+        'config': {
+            'model': {
+                'model_type': 'two_stage',
+                'd_model': 64,
+                'n_heads': 4,
+                'trade_threshold': INFERENCE_CONFIG['trade_threshold'],
+            },
+            'labeling': {
+                'strong_move_threshold': LABELING_CONFIG.strong_move_threshold,
+                'weak_move_threshold': LABELING_CONFIG.weak_move_threshold,
+                'clean_path_mae_threshold': LABELING_CONFIG.clean_path_mae_threshold,
+            },
+            'risk_management': {
+                'stop_loss_pct': INFERENCE_CONFIG['stop_loss_pct'],
+                'filter_high_volatility': INFERENCE_CONFIG['filter_high_volatility'],
+            }
+        },
+        'periods': {
+            pid: {
+                'name': aggregated_results[pid]['name'],
+                'is_primary': aggregated_results[pid]['is_primary'],
+                'metrics': aggregated_results[pid]['metrics']
+            }
+            for pid in aggregated_results
+        },
+        'aggregated': {
+            'primary_periods_profitable': n_profitable,
+            'average_return_mean': float(avg_return_mean),
+            'average_return_std': float(avg_return_std),
+            'average_sharpe_mean': float(avg_sharpe_mean),
+            'average_sharpe_std': float(avg_sharpe_std),
+            'worst_period_return': float(worst_return),
+            'best_period_return': float(best_return),
+            'stability_score': float(avg_stability),  # Lower is better
+        },
+        'verdict': verdict
+    }
+
+    # Save
+    with open(output_dir / 'multi_seed_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    return summary
+
+
+def compute_multi_seed_verdict(n_profitable: int, avg_return: float, avg_sharpe: float,
+                                worst_return: float, stability: float, n_seeds: int) -> Dict:
+    """
+    Compute verdict with stability consideration.
+
+    A model that's profitable but highly unstable (high std across seeds)
+    is less trustworthy than one with consistent results.
+    """
+    # Stability thresholds (return std across seeds)
+    HIGH_STABILITY = 5.0    # < 5% std is very stable
+    MEDIUM_STABILITY = 15.0  # < 15% std is acceptable
+    # > 15% std is unstable
+
+    stability_grade = "STABLE" if stability < HIGH_STABILITY else \
+                      "MODERATE" if stability < MEDIUM_STABILITY else "UNSTABLE"
+
+    # Base grading (same as before)
+    if worst_return < -30:
+        grade = 'F'
+        reasoning = f'Failed: Catastrophic loss in one period ({worst_return:.1f}%)'
+    elif n_profitable >= 5 and avg_sharpe > 1.5:
+        grade = 'A'
+        reasoning = 'Production Ready: All 5 periods profitable with excellent risk-adjusted returns'
+    elif n_profitable >= 4 and avg_sharpe > 1.0:
+        grade = 'B'
+        reasoning = 'Promising: 4/5 periods profitable with good risk metrics'
+    elif n_profitable >= 4 and avg_sharpe > 0.8:
+        grade = 'B'
+        reasoning = 'Promising: 4/5 periods profitable, meets minimum Sharpe requirement'
+    elif n_profitable >= 3 and avg_sharpe > 0.5:
+        grade = 'C'
+        reasoning = 'Needs Work: Mixed results, consider regime-specific models'
+    elif n_profitable >= 2:
+        grade = 'D'
+        reasoning = 'Significant Issues: Only 2/5 periods profitable'
+    elif n_profitable >= 1:
+        grade = 'D'
+        reasoning = 'Significant Issues: Only 1/5 period profitable'
+    else:
+        grade = 'F'
+        reasoning = 'Failed: No profitable periods'
+
+    # Downgrade if unstable
+    if stability_grade == "UNSTABLE" and grade in ['A', 'B']:
+        grade = 'C'
+        reasoning += f' (DOWNGRADED: High variance across seeds, avg std={stability:.1f}%)'
+
+    passed = grade in ['A', 'B']
+
+    return {
+        'grade': grade,
+        'passed': passed,
+        'reasoning': reasoning,
+        'stability_grade': stability_grade,
+        'stability_score': float(stability),
+        'n_seeds_evaluated': n_seeds,
+        'recommendation': 'Proceed to paper trading' if passed else 'Model needs improvement'
+    }
+
+
+def print_multi_seed_summary(summary: Dict):
+    """Print formatted multi-seed summary to console."""
+
+    print("\n" + "=" * 100)
+    print("WALK-FORWARD VALIDATION SUMMARY (MULTI-SEED)")
+    sl_pct = INFERENCE_CONFIG['stop_loss_pct']
+    if sl_pct:
+        print(f"(With {sl_pct*100:.1f}% Stop-Loss Applied)")
+    print(f"Seeds evaluated: {summary['seeds_used']}")
+    print("=" * 100)
+
+    print("\nPER-PERIOD RESULTS (mean ± std across seeds):")
+    print("-" * 100)
+    print(f"{'Period':<20} {'Return':>16} {'Sharpe':>14} {'Win%':>14} {'Trades':>12} {'Status':>10}")
+    print("-" * 100)
+
+    for pid, data in summary['periods'].items():
+        m = data['metrics']
+        status = "PRIMARY" if data['is_primary'] else "BONUS"
+        profitable = "PASS" if m['total_return_mean'] > 0 else "FAIL"
+        print(f"{data['name']:<20} "
+              f"{m['total_return_mean']:>+7.2f}±{m['total_return_std']:>5.2f}% "
+              f"{m['sharpe_ratio_mean']:>+6.2f}±{m['sharpe_ratio_std']:>4.2f} "
+              f"{m['win_rate_mean']:>6.1f}±{m['win_rate_std']:>4.1f}% "
+              f"{m['n_trades_mean']:>6.0f}±{m['n_trades_std']:>3.0f} "
+              f"{status:>8} {profitable}")
+
+    print("\n" + "=" * 100)
+    print("AGGREGATED (PRIMARY PERIODS ONLY):")
+    print("-" * 100)
+    agg = summary['aggregated']
+    print(f"Profitable Periods:    {agg['primary_periods_profitable']}/5 (based on mean returns)")
+    print(f"Average Return:        {agg['average_return_mean']:+.2f}% ± {agg['average_return_std']:.2f}%")
+    print(f"Average Sharpe:        {agg['average_sharpe_mean']:.2f} ± {agg['average_sharpe_std']:.2f}")
+    print(f"Worst Period (mean):   {agg['worst_period_return']:+.2f}%")
+    print(f"Best Period (mean):    {agg['best_period_return']:+.2f}%")
+    print(f"Stability Score:       {agg['stability_score']:.2f}% (lower is better)")
+
+    print("\n" + "=" * 100)
+    print("VERDICT:")
+    print("-" * 100)
+    v = summary['verdict']
+    print(f"Grade:          {v['grade']}")
+    print(f"Stability:      {v['stability_grade']} (avg std = {v['stability_score']:.2f}%)")
+    print(f"Passed:         {'YES' if v['passed'] else 'NO'}")
+    print(f"Reasoning:      {v['reasoning']}")
+    print(f"Recommendation: {v['recommendation']}")
+    print("=" * 100 + "\n")
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
-def run_walk_forward_validation():
-    """Execute full walk-forward validation."""
+def run_single_seed_validation(seed: int, full_df: pd.DataFrame, feature_pipeline: FeaturePipeline,
+                                labeler: CandleLabeler, price_cols: list, feature_cols: list) -> Dict:
+    """Run walk-forward validation for a single seed. Returns period_results dict."""
 
-    start_time = datetime.now()
+    set_seed(seed)
+    logger.info(f"Running validation with seed {seed}")
 
-    # CRITICAL: Set seed for reproducibility
-    set_seed(SEED)
-    logger.info(f"Random seed set to {SEED} for reproducibility")
-
-    print("\n" + "=" * 80)
-    print("WALK-FORWARD VALIDATION")
-    print("=" * 80)
-    print(f"Started: {start_time}")
-    print(f"Seed:    {SEED}")
-    print(f"Output:  {OUTPUT_DIR}")
-
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Load full dataset
-    full_df = load_full_dataset()
-
-    # Initialize components
-    feature_pipeline = FeaturePipeline()
-    labeler = CandleLabeler(LABELING_CONFIG)
-    price_cols, feature_cols = feature_pipeline.get_feature_columns()
-
-    # Store results
     period_results = {}
 
-    # Process each period
     for period in TEST_PERIODS:
-        print("\n" + "=" * 70)
-        print(f"PERIOD: {period.name}")
-        print(f"Description: {period.description}")
-        print("=" * 70)
-
-        period_dir = OUTPUT_DIR / period.period_id
+        period_dir = OUTPUT_DIR / f"seed_{seed}" / period.period_id
         period_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             # Prepare data
-            logger.info("Preparing data...")
             train_df, test_df, norm_stats = prepare_period_data(
                 full_df, period, feature_pipeline, labeler
             )
@@ -791,18 +1022,14 @@ def run_walk_forward_validation():
             train_split = train_df.iloc[:val_split_idx]
             val_split = train_df.iloc[val_split_idx:]
 
-            logger.info(f"  Train/Val split: {len(train_split):,} / {len(val_split):,}")
-
-            # Compute class weights for this period's training data
+            # Compute class weights
             label_counts = train_split['label'].value_counts()
             tradeable_count = label_counts.get(0, 0) + label_counts.get(4, 0)
             total = len(train_split)
             tradeable_ratio = tradeable_count / total if total > 0 else 0.1
             tradeable_pos_weight = (1 - tradeable_ratio) / max(tradeable_ratio, 0.01)
 
-            logger.info(f"  Tradeable ratio: {tradeable_ratio:.2%}, pos_weight: {tradeable_pos_weight:.2f}")
-
-            # Create config for this period
+            # Create config
             available_feature_cols = [c for c in feature_cols if c in train_split.columns]
             config = get_model_config(
                 n_price_features=len(price_cols),
@@ -816,21 +1043,16 @@ def run_walk_forward_validation():
                 price_cols, available_feature_cols, config
             )
 
-            logger.info(f"  Dataloaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)} batches")
-
             # Train model
-            logger.info("Training model...")
             model = train_period_model(train_loader, val_loader, config, period_dir)
 
             # Evaluate
-            logger.info("Evaluating on test period...")
             metrics, predictions_df = evaluate_period(
                 model, test_loader, config,
                 trade_threshold=INFERENCE_CONFIG['trade_threshold'],
                 filter_high_vol=INFERENCE_CONFIG['filter_high_volatility']
             )
 
-            # Store results
             period_results[period.period_id] = {
                 'name': period.name,
                 'is_primary': period.is_primary,
@@ -842,31 +1064,11 @@ def run_walk_forward_validation():
             # Save predictions
             predictions_df.to_csv(period_dir / 'predictions.csv', index=False)
 
-            # Save test results
-            with open(period_dir / 'test_results.json', 'w') as f:
-                json.dump({
-                    'period_id': period.period_id,
-                    'period_name': period.name,
-                    'is_primary': period.is_primary,
-                    'train_candles': len(train_df),
-                    'test_candles': len(test_df),
-                    'train_range': f"{train_df['timestamp'].min()} to {train_df['timestamp'].max()}",
-                    'test_range': f"{test_df['timestamp'].min()} to {test_df['timestamp'].max()}",
-                    'metrics': metrics
-                }, f, indent=2)
-
-            # Print period summary
-            print(f"\n  Results:")
-            print(f"    Total Return:   {metrics['total_return']:+.2f}%")
-            print(f"    Trades:         {metrics['n_trades']}")
-            print(f"    Win Rate:       {metrics['win_rate']:.1f}%")
-            print(f"    Sharpe Ratio:   {metrics['sharpe_ratio']:.2f}")
+            logger.info(f"  Seed {seed} | {period.name}: Return={metrics['total_return']:+.2f}%, "
+                       f"Sharpe={metrics['sharpe_ratio']:.2f}")
 
         except Exception as e:
-            logger.error(f"Error processing period {period.name}: {e}")
-            import traceback
-            traceback.print_exc()
-
+            logger.error(f"Error processing period {period.name} with seed {seed}: {e}")
             period_results[period.period_id] = {
                 'name': period.name,
                 'is_primary': period.is_primary,
@@ -874,6 +1076,7 @@ def run_walk_forward_validation():
                 'test_candles': 0,
                 'metrics': {
                     'total_return': 0.0,
+                    'total_return_no_sl': 0.0,
                     'n_trades': 0,
                     'win_rate': 0.0,
                     'sharpe_ratio': 0.0,
@@ -881,17 +1084,78 @@ def run_walk_forward_validation():
                 }
             }
 
-    # Generate summary
-    logger.info("\nGenerating summary report...")
-    summary = generate_summary_report(period_results, OUTPUT_DIR)
+    return period_results
+
+
+def run_walk_forward_validation():
+    """Execute multi-seed walk-forward validation for robust evaluation."""
+
+    start_time = datetime.now()
+
+    print("\n" + "=" * 80)
+    print("WALK-FORWARD VALIDATION (MULTI-SEED)")
+    print("=" * 80)
+    print(f"Started: {start_time}")
+    print(f"Seeds:   {SEEDS}")
+    print(f"Output:  {OUTPUT_DIR}")
+
+    # Create output directory
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load full dataset (once, shared across all seeds)
+    full_df = load_full_dataset()
+
+    # Initialize components
+    feature_pipeline = FeaturePipeline()
+    labeler = CandleLabeler(LABELING_CONFIG)
+    price_cols, feature_cols = feature_pipeline.get_feature_columns()
+
+    # Run validation for each seed
+    all_seed_results = {}
+
+    for seed_idx, seed in enumerate(SEEDS):
+        print("\n" + "=" * 80)
+        print(f"SEED {seed_idx + 1}/{len(SEEDS)}: {seed}")
+        print("=" * 80)
+
+        seed_results = run_single_seed_validation(
+            seed, full_df, feature_pipeline, labeler, price_cols, feature_cols
+        )
+        all_seed_results[seed] = seed_results
+
+        # Save individual seed results
+        seed_dir = OUTPUT_DIR / f"seed_{seed}"
+        with open(seed_dir / 'seed_summary.json', 'w') as f:
+            json.dump({
+                'seed': seed,
+                'results': seed_results
+            }, f, indent=2)
+
+    # Aggregate results across seeds
+    logger.info("\nAggregating results across seeds...")
+    aggregated_results = aggregate_multi_seed_results(all_seed_results)
+
+    # Generate multi-seed summary
+    summary = generate_multi_seed_summary(aggregated_results, SEEDS, OUTPUT_DIR)
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds() / 60
 
-    # Print summary
-    print_summary(summary)
+    # Print multi-seed summary
+    print_multi_seed_summary(summary)
 
-    print(f"Execution time: {duration:.1f} minutes")
+    # Also print individual seed results for transparency
+    print("\n" + "=" * 100)
+    print("INDIVIDUAL SEED RESULTS (for transparency):")
+    print("-" * 100)
+    for seed in SEEDS:
+        print(f"\nSeed {seed}:")
+        for pid, data in all_seed_results[seed].items():
+            if data['is_primary']:
+                m = data['metrics']
+                print(f"  {data['name']:<20} Return={m['total_return']:>+7.2f}%, Sharpe={m['sharpe_ratio']:>+6.2f}")
+
+    print(f"\nExecution time: {duration:.1f} minutes")
     print(f"Results saved to: {OUTPUT_DIR}")
 
     return summary
