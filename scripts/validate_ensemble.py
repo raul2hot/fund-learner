@@ -28,7 +28,7 @@ import json
 import torch
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import logging
 
@@ -46,7 +46,7 @@ from sph_net.ensemble import (
     calculate_ensemble_trading_returns,
 )
 from features.feature_pipeline import FeaturePipeline
-from data.dataset import TradingDataset
+from labeling.candle_classifier import CandleLabeler, LabelingConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,19 +61,26 @@ DATA_PATH = Path("data_pipleine/ml_data/BTCUSDT_ml_data.parquet")
 SEEDS = [42, 123, 456, 789, 1337]
 WINDOW_SIZE = 64
 
+# Labeling configuration - must match training
+LABELING_CONFIG = LabelingConfig(
+    strong_move_threshold=0.010,    # 1.0%
+    weak_move_threshold=0.004,      # 0.4%
+    clean_path_mae_threshold=0.010  # 1.0%
+)
+
 # Test periods (aligned with walk_forward_validation.py)
 PERIODS = [
-    ('period_0_covid', 'COVID Crash', False, '2020-03-01', '2020-05-31'),
-    ('period_1_may2021', 'May 2021 Crash', True, '2021-05-01', '2021-07-31'),
-    ('period_2_luna', 'Luna/3AC Collapse', True, '2022-05-01', '2022-07-31'),
-    ('period_3_ftx', 'FTX Crash', True, '2022-11-01', '2023-01-31'),
-    ('period_4_etf', 'ETF Rally', True, '2024-01-01', '2024-03-31'),
-    ('period_5_full', 'Full Data Holdout', True, '2024-10-01', '2025-12-15'),
+    ('period_0_covid', 'COVID Crash', False, '2020-03-01', '2020-05-31', '2020-02-29'),
+    ('period_1_may2021', 'May 2021 Crash', True, '2021-05-01', '2021-07-31', '2021-04-30'),
+    ('period_2_luna', 'Luna/3AC Collapse', True, '2022-05-01', '2022-07-31', '2022-04-30'),
+    ('period_3_ftx', 'FTX Crash', True, '2022-11-01', '2023-01-31', '2022-10-31'),
+    ('period_4_etf', 'ETF Rally', True, '2024-01-01', '2024-03-31', '2023-12-31'),
+    ('period_5_full', 'Full Data Holdout', True, '2024-10-01', '2025-12-15', '2024-09-30'),
 ]
 
 
-def load_price_data() -> pd.DataFrame:
-    """Load full price dataset."""
+def load_raw_data() -> pd.DataFrame:
+    """Load raw price dataset."""
     logger.info(f"Loading data from {DATA_PATH}")
 
     if not DATA_PATH.exists():
@@ -83,33 +90,86 @@ def load_price_data() -> pd.DataFrame:
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df = df.sort_values('timestamp').reset_index(drop=True)
 
+    # Drop rows with NaN in critical columns
+    critical_cols = ['open', 'high', 'low', 'close', 'volume']
+    df = df.dropna(subset=critical_cols)
+
     logger.info(f"Loaded {len(df):,} rows, {df['timestamp'].min().date()} to {df['timestamp'].max().date()}")
     return df
 
 
-def get_period_data(full_df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    """Get data for a specific period."""
-    start_ts = pd.Timestamp(start, tz='UTC')
-    end_ts = pd.Timestamp(end, tz='UTC')
+def prepare_period_data(
+    full_df: pd.DataFrame,
+    train_end: str,
+    test_start: str,
+    test_end: str,
+    feature_pipeline: FeaturePipeline,
+    labeler: CandleLabeler
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """
+    Prepare and normalize data for a test period.
 
-    mask = (full_df['timestamp'] >= start_ts) & (full_df['timestamp'] <= end_ts)
-    return full_df[mask].copy()
+    Uses training data (up to train_end) to compute normalization statistics,
+    then applies them to test data.
 
+    Returns:
+        (test_df_normalized, price_columns, feature_columns)
+    """
+    train_end_ts = pd.Timestamp(train_end, tz='UTC')
+    test_start_ts = pd.Timestamp(test_start, tz='UTC')
+    test_end_ts = pd.Timestamp(test_end, tz='UTC')
 
-def get_feature_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """Get price and feature column names from data."""
-    price_columns = ['open', 'high', 'low', 'close', 'volume']
+    # Split chronologically
+    train_raw = full_df[full_df['timestamp'] <= train_end_ts].copy()
+    test_raw = full_df[
+        (full_df['timestamp'] >= test_start_ts) &
+        (full_df['timestamp'] <= test_end_ts)
+    ].copy()
 
-    # Use FeaturePipeline to get feature columns
-    pipeline = FeaturePipeline(window_size=WINDOW_SIZE)
-    all_features = []
-    for group_features in pipeline.ENGINEERED_FEATURE_GROUPS.values():
-        all_features.extend(group_features)
+    logger.info(f"  Train: {len(train_raw):,} candles (for normalization)")
+    logger.info(f"  Test:  {len(test_raw):,} candles")
 
-    # Filter to columns that exist in the dataframe
-    feature_columns = [col for col in all_features if col in df.columns]
+    if len(test_raw) == 0:
+        raise ValueError("No test data for this period")
 
-    return price_columns, feature_columns
+    # Apply labeling (needed for some features that use labels)
+    train_labeled = labeler.label_dataset(train_raw)
+    test_labeled = labeler.label_dataset(test_raw)
+
+    # Compute features
+    logger.info("  Computing features...")
+    train_featured = feature_pipeline.compute_all_features(train_labeled)
+    test_featured = feature_pipeline.compute_all_features(test_labeled)
+
+    # Drop warmup period
+    warmup = feature_pipeline.get_warmup_periods()
+    train_clean = train_featured.iloc[warmup:].copy()
+    test_clean = test_featured.iloc[warmup:].copy()
+
+    logger.info(f"  After warmup: train={len(train_clean):,}, test={len(test_clean):,}")
+
+    # Get feature columns
+    price_columns = FeaturePipeline.PRICE_FEATURES
+    feature_columns = []
+    for group_features in FeaturePipeline.ENGINEERED_FEATURE_GROUPS.values():
+        feature_columns.extend(group_features)
+
+    # Filter to columns that exist
+    feature_columns = [col for col in feature_columns if col in test_clean.columns]
+    logger.info(f"  Using {len(price_columns)} price + {len(feature_columns)} engineered features")
+
+    # Normalize using training data statistics
+    logger.info("  Normalizing features (using training stats)...")
+    train_normalized, norm_stats = feature_pipeline.normalize_features(
+        train_clean,
+        fit_data=train_clean
+    )
+    test_normalized = feature_pipeline.apply_normalization(
+        test_clean,
+        norm_stats
+    )
+
+    return test_normalized, price_columns, feature_columns
 
 
 def evaluate_ensemble_on_period(
@@ -139,6 +199,7 @@ def evaluate_ensemble_on_period(
             'win_rate': 0,
             'avg_agreement': 0,
             'avg_confidence': 0,
+            'trade_rate': 0,
         }
 
     # Calculate trading returns
@@ -222,21 +283,21 @@ def main():
 
     print(f"Found {len(available_models)} model checkpoints")
 
-    # Load data
-    print("\nLoading data...")
+    # Load raw data
+    print("\nLoading raw data...")
     try:
-        full_df = load_price_data()
+        full_df = load_raw_data()
     except FileNotFoundError as e:
         print(f"ERROR: {e}")
         return 1
 
-    # Get feature columns
-    price_columns, feature_columns = get_feature_columns(full_df)
-    print(f"Using {len(price_columns)} price features, {len(feature_columns)} engineered features")
+    # Initialize feature pipeline and labeler
+    feature_pipeline = FeaturePipeline(window_size=WINDOW_SIZE)
+    labeler = CandleLabeler(LABELING_CONFIG)
 
     # Filter periods if specific one requested
     if args.period:
-        periods = [(p[0], p[1], p[2], p[3], p[4]) for p in PERIODS if p[0] == args.period]
+        periods = [p for p in PERIODS if p[0] == args.period]
         if not periods:
             print(f"ERROR: Unknown period '{args.period}'")
             print(f"Available: {[p[0] for p in PERIODS]}")
@@ -244,15 +305,12 @@ def main():
     else:
         periods = PERIODS
 
-    # Try to create ensemble
-    print(f"\nCreating {args.method} ensemble...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # We'll create a fresh ensemble for each period using that period's trained models
     all_results = []
 
-    for period_id, period_name, is_primary, start_date, end_date in periods:
+    for period_id, period_name, is_primary, start_date, end_date, train_end in periods:
         print(f"\n{'='*80}")
         print(f"Period: {period_name} ({period_id})")
         print(f"Date range: {start_date} to {end_date}")
@@ -260,6 +318,7 @@ def main():
 
         try:
             # Create ensemble for this period
+            print(f"  Creating {args.method} ensemble...")
             ensemble = create_ensemble_from_walk_forward(
                 RESULTS_DIR,
                 method=method,
@@ -270,18 +329,28 @@ def main():
                 temperature=args.temperature
             )
 
-            # Get period data
-            period_data = get_period_data(full_df, start_date, end_date)
-            print(f"Period data: {len(period_data):,} rows")
+            # Prepare period data with proper feature computation
+            print("  Preparing data...")
+            test_data, price_columns, feature_columns = prepare_period_data(
+                full_df,
+                train_end,
+                start_date,
+                end_date,
+                feature_pipeline,
+                labeler
+            )
 
-            if len(period_data) < WINDOW_SIZE + 10:
+            print(f"  Test data: {len(test_data):,} rows")
+
+            if len(test_data) < WINDOW_SIZE + 10:
                 print(f"  SKIP: Insufficient data")
                 continue
 
             # Evaluate ensemble
+            print("  Evaluating ensemble...")
             ensemble_metrics = evaluate_ensemble_on_period(
                 ensemble,
-                period_data,
+                test_data,
                 price_columns,
                 feature_columns,
                 args.stop_loss
@@ -315,11 +384,12 @@ def main():
             print(f"  Model agreement: {ensemble_metrics['avg_agreement']:.1%}")
 
             # Individual seed returns
-            print(f"\n  Individual seed returns:")
-            for seed in sorted(individual_returns.keys()):
-                ret = individual_returns[seed]
-                weight = ensemble.config.weights.get(seed, 0)
-                print(f"    Seed {seed}: {ret:>+8.2f}% (weight={weight:.3f})")
+            if any(individual_returns.values()):
+                print(f"\n  Individual seed returns:")
+                for seed in sorted(individual_returns.keys()):
+                    ret = individual_returns[seed]
+                    weight = ensemble.config.weights.get(seed, 0)
+                    print(f"    Seed {seed}: {ret:>+8.2f}% (weight={weight:.3f})")
 
             all_results.append({
                 'period_id': period_id,
@@ -376,6 +446,7 @@ def main():
             print(f"  Improvement:       {row['improvement']:+.2f}%")
 
         # Save results
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         output_path = RESULTS_DIR / f'ensemble_validation_{args.method}.csv'
         results_df.to_csv(output_path, index=False)
         print(f"\nResults saved to: {output_path}")

@@ -197,6 +197,29 @@ class ModelLoader:
             return []
         return [d.name for d in seed_dir.iterdir() if d.is_dir() and d.name.startswith("period_")]
 
+    def get_expected_dimensions(self) -> Dict[str, int]:
+        """
+        Get expected input dimensions from loaded model configs.
+
+        Returns:
+            Dict with n_price_features, n_engineered_features, window_size
+        """
+        if not self.model_configs:
+            return {
+                'n_price_features': 5,
+                'n_engineered_features': 34,
+                'window_size': 64
+            }
+
+        # Use first available config
+        config = next(iter(self.model_configs.values()))
+
+        return {
+            'n_price_features': getattr(config, 'n_price_features', 5),
+            'n_engineered_features': getattr(config, 'n_engineered_features', 34),
+            'window_size': getattr(config, 'window_size', 64)
+        }
+
 
 class EnsemblePredictor:
     """
@@ -725,9 +748,29 @@ def ensemble_predict_dataframe(
     device = ensemble.device
     predictions = []
 
-    # Extract arrays
+    # Validate columns exist
+    missing_price = [c for c in price_columns if c not in data.columns]
+    missing_features = [c for c in feature_columns if c not in data.columns]
+
+    if missing_price:
+        raise ValueError(f"Missing price columns in data: {missing_price}")
+    if missing_features:
+        logger.warning(f"Missing feature columns in data: {missing_features[:5]}... ({len(missing_features)} total)")
+        # Filter to only existing columns
+        feature_columns = [c for c in feature_columns if c in data.columns]
+
+    # Log dimensions
+    logger.info(f"Input dimensions: {len(price_columns)} price, {len(feature_columns)} features")
+
+    # Check for NaN values
     prices_arr = data[price_columns].values.astype(np.float32)
     features_arr = data[feature_columns].values.astype(np.float32)
+
+    nan_count = np.isnan(features_arr).sum()
+    if nan_count > 0:
+        logger.warning(f"Found {nan_count} NaN values in features, filling with 0")
+        features_arr = np.nan_to_num(features_arr, nan=0.0)
+
     timestamps = data['timestamp'].values
 
     n_samples = len(prices_arr) - window_size + 1
