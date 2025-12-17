@@ -312,11 +312,12 @@ def print_summary_table(results_df: pd.DataFrame, preset_name: str):
 
 
 def compare_presets(full_df: pd.DataFrame, stop_loss: float = -0.02):
-    """Compare all regime filter presets."""
+    """Compare all regime filter presets (including recommended v2.0 preset)."""
     presets = {
         'conservative': RegimePresets.conservative(),
         'moderate': RegimePresets.moderate(),
         'aggressive': RegimePresets.aggressive(),
+        'recommended': RegimePresets.recommended(),
     }
 
     all_results = []
@@ -365,9 +366,9 @@ def main():
     parser.add_argument(
         '--preset',
         type=str,
-        default='moderate',
-        choices=['conservative', 'moderate', 'aggressive'],
-        help='Regime preset to validate (default: moderate)'
+        default='recommended',
+        choices=['conservative', 'moderate', 'aggressive', 'recommended'],
+        help='Regime preset to validate (default: recommended)'
     )
     parser.add_argument(
         '--stop-loss',
@@ -400,6 +401,7 @@ def main():
             'conservative': RegimePresets.conservative(),
             'moderate': RegimePresets.moderate(),
             'aggressive': RegimePresets.aggressive(),
+            'recommended': RegimePresets.recommended(),
         }
         config = presets[args.preset]
         results = validate_single_preset(args.preset, config, full_df, args.stop_loss)
