@@ -617,18 +617,28 @@ def load_validation_results(results_dir: Path) -> Dict[int, Dict[str, float]]:
 
         results[seed] = {}
 
-        # Try to load from seed summary
+        # Try to load from seed summary (structure: {"seed": X, "results": {period: {metrics: {...}}}})
         summary_path = seed_dir / "seed_summary.json"
         if summary_path.exists():
             try:
                 with open(summary_path) as f:
                     summary = json.load(f)
+                    # Handle structure from walk_forward_validation.py
+                    if 'results' in summary:
+                        for period, data in summary['results'].items():
+                            if isinstance(data, dict) and 'metrics' in data:
+                                results[seed][period] = data['metrics'].get('total_return', 0)
+                            elif isinstance(data, dict):
+                                results[seed][period] = data.get('total_return', 0)
+                        if results[seed]:
+                            continue
+                    # Also try 'periods' key for backwards compatibility
                     if 'periods' in summary:
                         for period, metrics in summary['periods'].items():
                             results[seed][period] = metrics.get('total_return', 0)
-                    continue
-            except (json.JSONDecodeError, KeyError):
-                pass
+                        continue
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Error reading {summary_path}: {e}")
 
         # Fallback: load from individual period results
         for period_dir in seed_dir.glob("period_*"):
