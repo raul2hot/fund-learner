@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import argparse
 import random
 import pandas as pd
 import numpy as np
@@ -56,6 +57,13 @@ from sph_net.config import SPHNetConfig
 from sph_net.models.two_stage import TwoStageModel, TwoStageLoss, CalibratedTwoStageModel, apply_stop_loss_to_returns
 from training.trainer import Trainer
 from training.metrics import MetricTracker
+from regime_filter import (
+    RegimeFilter,
+    RegimeConfig,
+    RegimePresets,
+    MarketRegime,
+    apply_regime_filter_vectorized
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +117,15 @@ INFERENCE_CONFIG = {
     'trade_threshold': 0.55,
     'filter_high_volatility': True,
     'stop_loss_pct': -0.02,  # -2.0% stop-loss (critical for limiting tail risk)
+    'use_regime_filter': True,  # Enable regime filter by default
+    'regime_preset': 'moderate',  # 'conservative', 'moderate', or 'aggressive'
+}
+
+# Regime filter presets
+REGIME_PRESETS = {
+    'conservative': RegimePresets.conservative(),
+    'moderate': RegimePresets.moderate(),
+    'aggressive': RegimePresets.aggressive(),
 }
 
 # Test periods
@@ -398,10 +415,23 @@ def evaluate_period(
     test_loader: DataLoader,
     config: SPHNetConfig,
     trade_threshold: float = 0.55,
-    filter_high_vol: bool = True
+    filter_high_vol: bool = True,
+    use_regime_filter: bool = False,
+    regime_config: Optional[RegimeConfig] = None,
+    test_df: Optional[pd.DataFrame] = None
 ) -> Dict:
     """
     Evaluate model on test period.
+
+    Args:
+        model: Trained TwoStageModel
+        test_loader: DataLoader for test data
+        config: Model configuration
+        trade_threshold: Threshold for trade signals
+        filter_high_vol: Whether to filter high volatility (original method)
+        use_regime_filter: Whether to apply the new regime filter
+        regime_config: Configuration for regime filter (optional)
+        test_df: Original test DataFrame with timestamps and prices (needed for regime filter)
 
     Returns comprehensive metrics without any modification.
     """
@@ -418,6 +448,7 @@ def evaluate_period(
     calibrated_model.eval()
 
     all_results = []
+    sample_idx = 0
 
     for batch in test_loader:
         prices = batch['prices'].to(device)
@@ -446,7 +477,7 @@ def evaluate_period(
                     trade_return = -next_return[i].item()
                     trade_mae = next_mae_short[i].item()
 
-            all_results.append({
+            result_dict = {
                 'true_label': labels[i].item(),
                 'should_trade': results['should_trade'][i].item(),
                 'is_long': is_long,
@@ -455,12 +486,66 @@ def evaluate_period(
                 'next_return': next_return[i].item(),
                 'trade_return': trade_return,
                 'trade_mae': trade_mae,
-            })
+            }
+
+            # Add timestamp if available from test_df
+            if test_df is not None and sample_idx < len(test_df):
+                # Account for window_size offset in dataset
+                window_size = config.window_size
+                if sample_idx + window_size < len(test_df):
+                    result_dict['timestamp'] = test_df.iloc[sample_idx + window_size]['timestamp']
+                else:
+                    result_dict['timestamp'] = test_df.iloc[-1]['timestamp']
+
+            all_results.append(result_dict)
+            sample_idx += 1
 
     results_df = pd.DataFrame(all_results)
 
+    # Apply regime filter if enabled
+    regime_stats = {}
+    if use_regime_filter and test_df is not None and 'timestamp' in results_df.columns:
+        # Get price series from test data
+        price_series = test_df.set_index('timestamp')['close']
+
+        # Get funding rates if available
+        funding_series = None
+        if 'funding_rate' in test_df.columns:
+            funding_series = test_df.set_index('timestamp')['funding_rate']
+
+        # Apply regime filter
+        results_df_before = results_df.copy()
+        results_df = apply_regime_filter_vectorized(
+            results_df,
+            price_series,
+            funding_series,
+            config=regime_config
+        )
+
+        # Calculate regime statistics
+        regime_counts = results_df['regime'].value_counts()
+        regime_stats = {
+            'regime_normal_pct': float(regime_counts.get('normal', 0) / len(results_df) * 100),
+            'regime_elevated_pct': float(regime_counts.get('elevated', 0) / len(results_df) * 100),
+            'regime_extreme_pct': float(regime_counts.get('extreme', 0) / len(results_df) * 100),
+            'trades_blocked_by_regime': int(results_df['regime_blocked'].sum()),
+            'original_trade_count': int(results_df_before['should_trade'].sum()),
+        }
+
+        # Recalculate trade_return for blocked trades (set to 0)
+        blocked_mask = results_df['regime_blocked']
+        results_df.loc[blocked_mask, 'trade_return'] = 0.0
+        results_df.loc[blocked_mask, 'trade_mae'] = 0.0
+
+        logger.info(f"    Regime filter: blocked {regime_stats['trades_blocked_by_regime']} of "
+                   f"{regime_stats['original_trade_count']} trades")
+
     # Compute metrics with stop-loss
     metrics = compute_trading_metrics(results_df, stop_loss_pct=INFERENCE_CONFIG['stop_loss_pct'])
+
+    # Add regime statistics to metrics
+    if regime_stats:
+        metrics.update(regime_stats)
 
     return metrics, results_df
 
@@ -1046,11 +1131,19 @@ def run_single_seed_validation(seed: int, full_df: pd.DataFrame, feature_pipelin
             # Train model
             model = train_period_model(train_loader, val_loader, config, period_dir)
 
+            # Get regime filter configuration
+            use_regime_filter = INFERENCE_CONFIG.get('use_regime_filter', False)
+            regime_preset = INFERENCE_CONFIG.get('regime_preset', 'moderate')
+            regime_config = REGIME_PRESETS.get(regime_preset, RegimePresets.moderate())
+
             # Evaluate
             metrics, predictions_df = evaluate_period(
                 model, test_loader, config,
                 trade_threshold=INFERENCE_CONFIG['trade_threshold'],
-                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility']
+                filter_high_vol=INFERENCE_CONFIG['filter_high_volatility'],
+                use_regime_filter=use_regime_filter,
+                regime_config=regime_config,
+                test_df=test_df
             )
 
             period_results[period.period_id] = {
@@ -1161,7 +1254,100 @@ def run_walk_forward_validation():
     return summary
 
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Walk-forward validation with optional regime filtering',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Run with default settings (regime filter enabled, moderate preset)
+    python scripts/walk_forward_validation.py
+
+    # Run without regime filter
+    python scripts/walk_forward_validation.py --no-regime-filter
+
+    # Run with conservative regime filter
+    python scripts/walk_forward_validation.py --regime-preset conservative
+
+    # Run specific seeds
+    python scripts/walk_forward_validation.py --seeds 42,1337
+        """
+    )
+
+    parser.add_argument(
+        '--regime-filter', '--rf',
+        action='store_true',
+        default=True,
+        dest='regime_filter',
+        help='Apply regime filter during validation (default: enabled)'
+    )
+    parser.add_argument(
+        '--no-regime-filter', '--no-rf',
+        action='store_false',
+        dest='regime_filter',
+        help='Disable regime filter'
+    )
+    parser.add_argument(
+        '--regime-preset',
+        type=str,
+        default='moderate',
+        choices=['conservative', 'moderate', 'aggressive'],
+        help='Regime filter configuration preset (default: moderate)'
+    )
+    parser.add_argument(
+        '--seeds',
+        type=str,
+        default=None,
+        help='Comma-separated list of seeds to use (default: 42,123,456,789,1337)'
+    )
+    parser.add_argument(
+        '--stop-loss',
+        type=float,
+        default=-0.02,
+        help='Stop-loss percentage as decimal (default: -0.02 for -2%%)'
+    )
+    parser.add_argument(
+        '--trade-threshold',
+        type=float,
+        default=0.55,
+        help='Trade probability threshold (default: 0.55)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=None,
+        help='Output directory for results (default: experiments/walk_forward)'
+    )
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
+    # Update configuration based on command-line arguments
+    INFERENCE_CONFIG['use_regime_filter'] = args.regime_filter
+    INFERENCE_CONFIG['regime_preset'] = args.regime_preset
+    INFERENCE_CONFIG['stop_loss_pct'] = args.stop_loss
+    INFERENCE_CONFIG['trade_threshold'] = args.trade_threshold
+
+    # Update seeds if specified
+    if args.seeds:
+        SEEDS.clear()
+        SEEDS.extend([int(s.strip()) for s in args.seeds.split(',')])
+
+    # Update output directory if specified
+    if args.output_dir:
+        OUTPUT_DIR = Path(args.output_dir)
+
+    # Log configuration
+    logger.info(f"Configuration:")
+    logger.info(f"  Regime filter: {args.regime_filter} ({args.regime_preset})")
+    logger.info(f"  Stop-loss: {args.stop_loss * 100:.1f}%")
+    logger.info(f"  Trade threshold: {args.trade_threshold}")
+    logger.info(f"  Seeds: {SEEDS}")
+
     try:
         summary = run_walk_forward_validation()
         sys.exit(0 if summary['verdict']['passed'] else 1)
