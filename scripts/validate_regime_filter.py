@@ -45,6 +45,8 @@ RESULTS_DIR = Path("experiments/walk_forward")
 DATA_PATH = Path("data_pipleine/ml_data/BTCUSDT_ml_data.parquet")
 
 SEEDS = [42, 123, 456, 789, 1337]
+WINDOW_SIZE = 64  # Must match SPHNetConfig.window_size
+
 PERIODS = [
     ('period_0_covid', 'COVID Crash', False),
     ('period_1_may2021', 'May 2021 Crash', True),
@@ -208,8 +210,21 @@ def validate_single_preset(
 
                 # Ensure timestamp column exists
                 if 'timestamp' not in predictions.columns:
-                    # Try to align with period data based on index
-                    predictions['timestamp'] = period_df['timestamp'].iloc[:len(predictions)].values
+                    # Predictions correspond to samples starting from index WINDOW_SIZE
+                    # because TradingDataset uses a lookback window of 64 candles
+                    # So prediction[0] corresponds to period_df timestamp at index WINDOW_SIZE
+                    start_idx = WINDOW_SIZE
+                    end_idx = start_idx + len(predictions)
+                    if end_idx <= len(period_df):
+                        predictions['timestamp'] = period_df['timestamp'].iloc[start_idx:end_idx].values
+                    else:
+                        # Fallback: use available timestamps
+                        available = len(period_df) - start_idx
+                        if available > 0:
+                            predictions = predictions.iloc[:available].copy()
+                            predictions['timestamp'] = period_df['timestamp'].iloc[start_idx:].values
+                        else:
+                            continue  # Skip if not enough data
 
                 # Calculate original metrics
                 original_metrics = calculate_returns(predictions, with_stop_loss=stop_loss)
