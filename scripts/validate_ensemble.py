@@ -192,9 +192,17 @@ def evaluate_ensemble_on_period(
     period_data: pd.DataFrame,
     price_columns: List[str],
     feature_columns: List[str],
-    stop_loss: float = -0.02
+    stop_loss: float = -0.02,
+    use_regime_filter: bool = True
 ) -> Dict:
-    """Evaluate ensemble on a single period."""
+    """
+    Evaluate ensemble on a single period.
+
+    Uses the same return calculation methodology as individual seeds:
+    - Open-to-close returns (next_return column)
+    - MAE-aware stop-loss detection
+    - Regime filtering for high volatility periods
+    """
     # Generate predictions
     predictions = ensemble_predict_dataframe(
         ensemble,
@@ -217,11 +225,13 @@ def evaluate_ensemble_on_period(
             'trade_rate': 0,
         }
 
-    # Calculate trading returns
+    # Calculate trading returns using same methodology as individual seeds
+    # This ensures apples-to-apples comparison
     metrics = calculate_ensemble_trading_returns(
         predictions,
         period_data,
-        stop_loss_pct=stop_loss
+        stop_loss_pct=stop_loss,
+        use_regime_filter=use_regime_filter
     )
 
     # Add ensemble-specific metrics
@@ -286,6 +296,12 @@ def main():
                         help='Period to use for performance weighting')
     parser.add_argument('--temperature', type=float, default=2.0,
                         help='Temperature for weighted ensemble softmax (higher = more uniform weights)')
+    parser.add_argument('--regime-filter', action='store_true', default=True,
+                        dest='regime_filter',
+                        help='Apply regime filter during validation (default: enabled)')
+    parser.add_argument('--no-regime-filter', action='store_false',
+                        dest='regime_filter',
+                        help='Disable regime filter')
     args = parser.parse_args()
 
     # Map method string to enum
@@ -301,7 +317,9 @@ def main():
     print(f"ENSEMBLE VALIDATION - {args.method.upper()} METHOD")
     print("=" * 100)
     print(f"Strategy: Walk-forward validation using period-appropriate models (no look-ahead bias)")
-    print(f"Stop-loss: {args.stop_loss * 100:.1f}%")
+    print(f"Methodology: Open-to-close returns with MAE-aware stop-loss (same as individual seeds)")
+    print(f"Stop-loss: {args.stop_loss * 100:.1f}% (MAE-aware)")
+    print(f"Regime filter: {'ENABLED (moderate)' if args.regime_filter else 'DISABLED'}")
     if args.method == 'weighted':
         print(f"Default weight by: {args.weight_by} (temperature={args.temperature})")
         print(f"Note: Early periods use equal weights (no prior crash data available)")
@@ -400,7 +418,8 @@ def main():
                 test_data,
                 price_columns,
                 feature_columns,
-                args.stop_loss
+                args.stop_loss,
+                use_regime_filter=args.regime_filter
             )
 
             # Load individual seed results
@@ -429,6 +448,11 @@ def main():
                   f"Sharpe: {ensemble_metrics['sharpe']:.2f}, "
                   f"Win rate: {ensemble_metrics['win_rate']:.1f}%")
             print(f"  Model agreement: {ensemble_metrics['avg_agreement']:.1%}")
+            # Show stop-loss and regime filter stats
+            n_stopped = ensemble_metrics.get('n_stopped_out', 0)
+            n_regime = ensemble_metrics.get('n_regime_blocked', 0)
+            if n_stopped > 0 or n_regime > 0:
+                print(f"  Stop-loss triggered: {n_stopped}, Regime blocked: {n_regime}")
             if 'n_volatility_filtered' in ensemble_metrics:
                 print(f"  Volatility filtered: {ensemble_metrics['n_volatility_filtered']} "
                       f"({ensemble_metrics['pct_volatility_filtered']:.1f}%)")

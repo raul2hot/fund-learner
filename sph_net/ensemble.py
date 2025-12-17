@@ -891,23 +891,35 @@ def calculate_ensemble_trading_returns(
     predictions: pd.DataFrame,
     price_data: pd.DataFrame,
     stop_loss_pct: float = -0.02,
-    price_col: str = 'close'
+    use_regime_filter: bool = True,
+    regime_config: Optional[Dict] = None
 ) -> Dict[str, float]:
     """
     Calculate trading returns from ensemble predictions.
 
+    IMPORTANT: Uses open-to-close returns (same as individual seed methodology)
+    to ensure apples-to-apples comparison.
+
     Args:
         predictions: DataFrame with should_trade, is_long columns
-        price_data: DataFrame with timestamp and price columns
+        price_data: DataFrame with timestamp, open, close, next_return,
+                   next_mae_long, next_mae_short columns (from labeling)
         stop_loss_pct: Stop-loss as decimal (e.g., -0.02 for -2%)
-        price_col: Price column to use
+        use_regime_filter: Whether to apply regime filtering
+        regime_config: Optional regime filter configuration
 
     Returns:
         Dictionary with trading metrics
     """
     # Ensure timestamp columns have matching timezone
     pred_df = predictions.copy()
-    price_df = price_data[['timestamp', price_col]].copy()
+
+    # Get required columns from price_data
+    required_cols = ['timestamp']
+    available_cols = [c for c in price_data.columns if c in
+                      ['timestamp', 'open', 'close', 'next_return',
+                       'next_mae_long', 'next_mae_short']]
+    price_df = price_data[available_cols].copy()
 
     # Convert both to UTC-aware if needed
     if pred_df['timestamp'].dt.tz is None:
@@ -915,27 +927,116 @@ def calculate_ensemble_trading_returns(
     if price_df['timestamp'].dt.tz is None:
         price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
 
-    # Merge predictions with prices
+    # Merge predictions with price data
     merged = pred_df.merge(
         price_df,
         on='timestamp',
         how='left'
     )
 
-    # Calculate forward returns
-    merged['fwd_return'] = merged[price_col].pct_change().shift(-1)
+    # Use next_return if available (open-to-close, same as individual seeds)
+    # Otherwise fall back to close-to-close calculation
+    if 'next_return' in merged.columns:
+        merged['fwd_return'] = merged['next_return']
+        logger.debug("Using next_return (open-to-close) for return calculation")
+    else:
+        # Fallback: calculate close-to-close returns
+        if 'close' in merged.columns:
+            merged['fwd_return'] = merged['close'].pct_change().shift(-1)
+            logger.warning("next_return not available, using close-to-close returns (not comparable to individual seeds)")
+        else:
+            logger.error("No return data available")
+            return {'total_return': 0, 'n_trades': 0, 'sharpe': 0, 'win_rate': 0}
 
-    # Position: +1 for long, -1 for short, 0 for hold
+    # Apply regime filter if enabled
+    n_regime_blocked = 0
+    if use_regime_filter and 'close' in price_df.columns:
+        try:
+            from regime_filter import apply_regime_filter_vectorized, RegimePresets
+
+            # Create a temp predictions df with required format
+            temp_pred = merged[['timestamp', 'should_trade', 'is_long']].copy()
+
+            # Get price series
+            price_series = price_df.set_index('timestamp')['close']
+
+            # Get funding rates if available
+            funding_series = None
+            if 'funding_rate' in price_df.columns:
+                funding_series = price_df.set_index('timestamp')['funding_rate']
+
+            # Apply regime filter
+            config = regime_config if regime_config else RegimePresets.moderate()
+            filtered = apply_regime_filter_vectorized(
+                temp_pred,
+                price_series,
+                funding_series,
+                config=config
+            )
+
+            # Update should_trade based on regime filter
+            if 'regime_blocked' in filtered.columns:
+                n_regime_blocked = int(filtered['regime_blocked'].sum())
+                # Merge back the regime_blocked column
+                merged = merged.merge(
+                    filtered[['timestamp', 'regime_blocked', 'regime']],
+                    on='timestamp',
+                    how='left'
+                )
+                merged['regime_blocked'] = merged['regime_blocked'].fillna(False)
+            else:
+                merged['regime_blocked'] = False
+
+        except ImportError:
+            logger.warning("regime_filter module not available, skipping regime filtering")
+            merged['regime_blocked'] = False
+        except Exception as e:
+            logger.warning(f"Regime filter failed: {e}, skipping")
+            merged['regime_blocked'] = False
+    else:
+        merged['regime_blocked'] = False
+
+    # Calculate trade returns based on position
+    # Position: +1 for long (return = next_return), -1 for short (return = -next_return)
     merged['position'] = 0.0
-    merged.loc[merged['should_trade'] & merged['is_long'], 'position'] = 1.0
-    merged.loc[merged['should_trade'] & ~merged['is_long'], 'position'] = -1.0
+    # Only count non-blocked trades
+    trade_mask = merged['should_trade'] & ~merged['regime_blocked']
+    merged.loc[trade_mask & merged['is_long'], 'position'] = 1.0
+    merged.loc[trade_mask & ~merged['is_long'], 'position'] = -1.0
 
-    # Trade returns
+    # Trade returns: position * forward return
     merged['trade_return'] = merged['position'] * merged['fwd_return']
 
-    # Apply stop-loss (simplified)
+    # Apply MAE-aware stop-loss (same as individual seed methodology)
+    n_stopped_out = 0
     if stop_loss_pct is not None:
-        merged['trade_return'] = merged['trade_return'].clip(lower=stop_loss_pct)
+        has_mae = 'next_mae_long' in merged.columns and 'next_mae_short' in merged.columns
+
+        if has_mae:
+            # MAE-aware stop-loss: check if intra-candle move hit stop
+            # For long trades: check if mae_long (downside) > stop_loss threshold
+            # For short trades: check if mae_short (upside) > stop_loss threshold
+            long_mask = merged['position'] == 1.0
+            short_mask = merged['position'] == -1.0
+
+            # Long trades stopped if MAE exceeded stop-loss
+            long_stopped = long_mask & (merged['next_mae_long'] > abs(stop_loss_pct))
+            # Short trades stopped if MAE exceeded stop-loss
+            short_stopped = short_mask & (merged['next_mae_short'] > abs(stop_loss_pct))
+
+            stopped_mask = long_stopped | short_stopped
+            n_stopped_out = int(stopped_mask.sum())
+
+            # Set stopped trades to stop-loss return
+            merged.loc[stopped_mask, 'trade_return'] = stop_loss_pct
+
+            logger.debug(f"MAE-aware stop-loss: {n_stopped_out} trades stopped out")
+        else:
+            # Fallback: simple clip (less accurate)
+            before_clip = merged['trade_return'].copy()
+            merged['trade_return'] = merged['trade_return'].clip(lower=stop_loss_pct)
+            n_stopped_out = int((before_clip < stop_loss_pct).sum())
+            logger.debug(f"Simple stop-loss clip: {n_stopped_out} returns clipped")
 
     # Remove NaN
     valid = merged.dropna(subset=['trade_return'])
@@ -968,4 +1069,6 @@ def calculate_ensemble_trading_returns(
         'sharpe': sharpe,
         'win_rate': win_rate,
         'avg_return_per_trade': trade_returns.mean() * 100 if len(trade_returns) > 0 else 0,
+        'n_stopped_out': n_stopped_out,
+        'n_regime_blocked': n_regime_blocked,
     }
