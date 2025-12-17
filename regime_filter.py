@@ -129,19 +129,24 @@ class RegimePresets:
     def conservative() -> RegimeConfig:
         """
         Conservative settings - triggers regime changes earlier.
-        Best for risk-averse strategies or uncertain market conditions.
+        Most protective - best for risk-averse strategies.
+
+        Thresholds are LOWER (more sensitive) than moderate:
+        - Triggers extreme at 1.5% hourly vol (vs 2% moderate)
+        - Triggers on -3% 24h drop (vs -5% moderate)
+        - Triggers on -5% drawdown from 72h high (vs -8% moderate)
         """
         return RegimeConfig(
-            vol_elevated_threshold=1.3,
-            vol_extreme_threshold=2.0,
-            vol_absolute_elevated=0.03,  # 3% daily std
-            vol_absolute_extreme=0.045,  # 4.5% daily std
-            vol_percentile_elevated=0.70,
-            vol_percentile_extreme=0.90,
-            price_drop_elevated=-0.03,
-            price_drop_extreme=-0.07,
-            drawdown_elevated=-0.07,
-            drawdown_extreme=-0.15,
+            vol_elevated_threshold=1.2,
+            vol_extreme_threshold=1.8,
+            vol_absolute_elevated=0.012,  # 1.2% hourly std
+            vol_absolute_extreme=0.015,   # 1.5% hourly std
+            vol_percentile_elevated=0.60,
+            vol_percentile_extreme=0.80,
+            price_drop_elevated=-0.02,    # -2% in 24h
+            price_drop_extreme=-0.03,     # -3% in 24h
+            drawdown_elevated=-0.03,      # -3% from 72h high
+            drawdown_extreme=-0.05,       # -5% from 72h high
             max_trades_per_day_elevated=5,
             max_trades_per_day_extreme=0,
             position_scale_elevated=0.3,
@@ -151,27 +156,46 @@ class RegimePresets:
     def moderate() -> RegimeConfig:
         """
         Moderate settings - balanced approach.
-        Default configuration suitable for most strategies.
+        Good protection while allowing trading in moderate stress.
+
+        Thresholds:
+        - Triggers extreme at 2% hourly vol
+        - Triggers on -5% 24h drop
+        - Triggers on -8% drawdown from 72h high
         """
-        return RegimeConfig()  # Uses default values
+        return RegimeConfig(
+            vol_absolute_elevated=0.015,  # 1.5% hourly std
+            vol_absolute_extreme=0.02,    # 2% hourly std
+            vol_percentile_elevated=0.70,
+            vol_percentile_extreme=0.85,
+            price_drop_elevated=-0.03,    # -3% in 24h
+            price_drop_extreme=-0.05,     # -5% in 24h
+            drawdown_elevated=-0.05,      # -5% from 72h high
+            drawdown_extreme=-0.08,       # -8% from 72h high
+        )
 
     @staticmethod
     def aggressive() -> RegimeConfig:
         """
         Aggressive settings - allows more trading during stress.
         Use only if strategy has proven resilience to volatility.
+
+        Thresholds are HIGHER (less sensitive) than moderate:
+        - Triggers extreme at 3% hourly vol (vs 2% moderate)
+        - Triggers on -10% 24h drop (vs -5% moderate)
+        - Triggers on -15% drawdown (vs -8% moderate)
         """
         return RegimeConfig(
             vol_elevated_threshold=2.0,
             vol_extreme_threshold=3.0,
-            vol_absolute_elevated=0.05,  # 5% daily std
-            vol_absolute_extreme=0.08,   # 8% daily std
-            vol_percentile_elevated=0.90,
-            vol_percentile_extreme=0.98,
-            price_drop_elevated=-0.07,
-            price_drop_extreme=-0.15,
-            drawdown_elevated=-0.15,
-            drawdown_extreme=-0.30,
+            vol_absolute_elevated=0.025,  # 2.5% hourly std
+            vol_absolute_extreme=0.03,    # 3% hourly std
+            vol_percentile_elevated=0.85,
+            vol_percentile_extreme=0.95,
+            price_drop_elevated=-0.07,    # -7% in 24h
+            price_drop_extreme=-0.10,     # -10% in 24h
+            drawdown_elevated=-0.10,      # -10% from 72h high
+            drawdown_extreme=-0.15,       # -15% from 72h high
             max_trades_per_day_elevated=20,
             max_trades_per_day_extreme=5,
             position_scale_elevated=0.7,
