@@ -826,6 +826,15 @@ def ensemble_predict_dataframe(
 
     timestamps = data['timestamp'].values
 
+    # Check for next_return column (used for accurate return calculation)
+    has_next_return = 'next_return' in data.columns
+    if has_next_return:
+        next_return_arr = data['next_return'].values.astype(np.float32)
+        logger.info("Found next_return column - will use for return calculations")
+    else:
+        next_return_arr = None
+        logger.warning("No next_return column - will compute returns from prices")
+
     n_samples = len(prices_arr) - window_size + 1
 
     if n_samples <= 0:
@@ -863,8 +872,11 @@ def ensemble_predict_dataframe(
         # Store results
         for j in range(end_idx - start_idx):
             idx = start_idx + j
+            # Label index is at the end of the window
+            label_idx = idx + window_size - 1
+
             pred = {
-                'timestamp': timestamps[idx + window_size - 1],
+                'timestamp': timestamps[label_idx],
                 'should_trade': result['should_trade'][j].item(),
                 'is_long': result['is_long'][j].item(),
                 'tradeable_prob': result['tradeable_prob'][j].item(),
@@ -873,6 +885,10 @@ def ensemble_predict_dataframe(
                 'agreement': result['agreement'][j].item(),
                 'volatility_filtered': result['volatility_filtered'][j].item(),
             }
+
+            # Include next_return if available (for accurate return calculation)
+            if has_next_return and label_idx < len(next_return_arr):
+                pred['next_return'] = next_return_arr[label_idx]
 
             # Add individual predictions if requested
             if return_individual and 'individual_predictions' in result:
@@ -896,6 +912,9 @@ def calculate_ensemble_trading_returns(
     """
     Calculate trading returns from ensemble predictions.
 
+    Uses 'next_return' column if available (matches original validation),
+    otherwise computes returns from prices.
+
     Args:
         predictions: DataFrame with should_trade, is_long columns
         price_data: DataFrame with timestamp and price columns
@@ -905,53 +924,77 @@ def calculate_ensemble_trading_returns(
     Returns:
         Dictionary with trading metrics
     """
-    # Ensure timestamp columns have matching timezone
     pred_df = predictions.copy()
-    price_df = price_data[['timestamp', price_col]].copy()
 
-    # Convert both to UTC-aware if needed
-    if pred_df['timestamp'].dt.tz is None:
-        pred_df['timestamp'] = pd.to_datetime(pred_df['timestamp']).dt.tz_localize('UTC')
-    if price_df['timestamp'].dt.tz is None:
-        price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
+    # Use next_return from predictions if available (computed by labeler)
+    if 'next_return' in pred_df.columns:
+        logger.info("Using next_return column for return calculation (matches original validation)")
+        pred_df['fwd_return'] = pred_df['next_return']
 
-    # Merge predictions with prices
-    merged = pred_df.merge(
-        price_df,
-        on='timestamp',
-        how='left'
-    )
+        # Log diagnostics
+        valid_returns = pred_df['fwd_return'].dropna()
+        logger.info(f"  next_return stats: mean={valid_returns.mean()*100:.4f}%, "
+                   f"std={valid_returns.std()*100:.4f}%, n={len(valid_returns)}")
+    else:
+        # Fallback: compute from prices (less accurate)
+        logger.warning("No next_return column - computing returns from prices")
 
-    # Calculate forward returns
-    merged['fwd_return'] = merged[price_col].pct_change().shift(-1)
+        # Ensure timestamp columns have matching timezone
+        price_df = price_data[['timestamp', price_col]].copy()
+
+        if pred_df['timestamp'].dt.tz is None:
+            pred_df['timestamp'] = pd.to_datetime(pred_df['timestamp']).dt.tz_localize('UTC')
+        if price_df['timestamp'].dt.tz is None:
+            price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
+
+        # Filter price_df to only include timestamps in predictions (fix shape mismatch)
+        pred_timestamps = set(pred_df['timestamp'])
+        price_df = price_df[price_df['timestamp'].isin(pred_timestamps)]
+
+        # Merge predictions with prices
+        pred_df = pred_df.merge(price_df, on='timestamp', how='left')
+
+        # Calculate forward returns from price changes
+        pred_df['fwd_return'] = pred_df[price_col].pct_change().shift(-1)
 
     # Position: +1 for long, -1 for short, 0 for hold
-    merged['position'] = 0.0
-    merged.loc[merged['should_trade'] & merged['is_long'], 'position'] = 1.0
-    merged.loc[merged['should_trade'] & ~merged['is_long'], 'position'] = -1.0
+    pred_df['position'] = 0.0
+    pred_df.loc[pred_df['should_trade'] & pred_df['is_long'], 'position'] = 1.0
+    pred_df.loc[pred_df['should_trade'] & ~pred_df['is_long'], 'position'] = -1.0
 
-    # Trade returns
-    merged['trade_return'] = merged['position'] * merged['fwd_return']
+    # Trade returns: position * forward_return
+    # For long: we want positive return when price goes up
+    # For short: we want positive return when price goes down (hence -1 * return)
+    pred_df['trade_return'] = pred_df['position'] * pred_df['fwd_return']
 
-    # Apply stop-loss (simplified)
+    # Apply stop-loss (simplified - clips individual trade returns)
     if stop_loss_pct is not None:
-        merged['trade_return'] = merged['trade_return'].clip(lower=stop_loss_pct)
+        pred_df['trade_return'] = pred_df['trade_return'].clip(lower=stop_loss_pct)
 
     # Remove NaN
-    valid = merged.dropna(subset=['trade_return'])
+    valid = pred_df.dropna(subset=['trade_return'])
 
     if len(valid) == 0:
         return {'total_return': 0, 'n_trades': 0, 'sharpe': 0, 'win_rate': 0}
 
-    # Metrics
-    trade_returns = valid[valid['position'] != 0]['trade_return']
+    # Metrics - only count rows where we actually traded
+    trades = valid[valid['position'] != 0]
+    trade_returns = trades['trade_return']
 
     total_return = trade_returns.sum() * 100  # As percentage
-    n_trades = (valid['position'] != 0).sum()
+    n_trades = len(trades)
+
+    # Log diagnostics
+    n_long = (trades['position'] == 1.0).sum()
+    n_short = (trades['position'] == -1.0).sum()
+    logger.info(f"  Trades: {n_trades} total ({n_long} long, {n_short} short)")
 
     if len(trade_returns) > 0 and trade_returns.std() > 0:
         # Annualized Sharpe using trade frequency
-        days = (valid['timestamp'].max() - valid['timestamp'].min()).days
+        if 'timestamp' in valid.columns:
+            days = (valid['timestamp'].max() - valid['timestamp'].min()).days
+        else:
+            days = 90  # Assume ~3 month period
         if days > 0:
             trades_per_year = n_trades / days * 365
             sharpe = (trade_returns.mean() / trade_returns.std()) * np.sqrt(trades_per_year)
