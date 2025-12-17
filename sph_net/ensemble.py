@@ -843,9 +843,19 @@ def calculate_ensemble_trading_returns(
     Returns:
         Dictionary with trading metrics
     """
+    # Ensure timestamp columns have matching timezone
+    pred_df = predictions.copy()
+    price_df = price_data[['timestamp', price_col]].copy()
+
+    # Convert both to UTC-aware if needed
+    if pred_df['timestamp'].dt.tz is None:
+        pred_df['timestamp'] = pd.to_datetime(pred_df['timestamp']).dt.tz_localize('UTC')
+    if price_df['timestamp'].dt.tz is None:
+        price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
+
     # Merge predictions with prices
-    merged = predictions.merge(
-        price_data[['timestamp', price_col]],
+    merged = pred_df.merge(
+        price_df,
         on='timestamp',
         how='left'
     )
