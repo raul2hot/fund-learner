@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import random
 import pandas as pd
 import numpy as np
 import json
@@ -30,6 +31,22 @@ import torch
 from datetime import datetime
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass, asdict
+
+
+def set_seed(seed: int = 42):
+    """
+    Set random seeds for reproducibility.
+
+    CRITICAL: This must be called before any training to ensure
+    reproducible results across runs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 from labeling.candle_classifier import CandleLabeler, LabelingConfig
 from features.feature_pipeline import FeaturePipeline
@@ -50,6 +67,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # CONFIGURATION - FROZEN (DO NOT MODIFY BETWEEN PERIODS)
 # =============================================================================
+
+# Random seed for reproducibility - FROZEN
+SEED = 42
 
 DATA_PATH = Path("data_pipleine/ml_data/BTCUSDT_ml_data.parquet")
 OUTPUT_DIR = Path("experiments/walk_forward")
@@ -583,6 +603,7 @@ def generate_summary_report(period_results: Dict, output_dir: Path) -> Dict:
     summary = {
         'generated_at': datetime.now().isoformat(),
         'config': {
+            'seed': SEED,  # For reproducibility tracking
             'model': {
                 'model_type': 'two_stage',
                 'd_model': 64,
@@ -723,10 +744,15 @@ def run_walk_forward_validation():
 
     start_time = datetime.now()
 
+    # CRITICAL: Set seed for reproducibility
+    set_seed(SEED)
+    logger.info(f"Random seed set to {SEED} for reproducibility")
+
     print("\n" + "=" * 80)
     print("WALK-FORWARD VALIDATION")
     print("=" * 80)
     print(f"Started: {start_time}")
+    print(f"Seed:    {SEED}")
     print(f"Output:  {OUTPUT_DIR}")
 
     # Create output directory

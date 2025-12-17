@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
+import random
 import pandas as pd
 import numpy as np
 import json
@@ -28,8 +29,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Random seed for reproducibility
+SEED = 42
+
+
+def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 def main():
+    # Set seed for reproducibility
+    set_seed(SEED)
+    logger.info(f"Random seed set to {SEED}")
+
     # === Configuration ===
     DATA_DIR = Path("prepared_data")
     OUTPUT_DIR = Path("experiments/run_001")
