@@ -915,7 +915,6 @@ def calculate_ensemble_trading_returns(
     pred_df = predictions.copy()
 
     # Get required columns from price_data
-    required_cols = ['timestamp']
     available_cols = [c for c in price_data.columns if c in
                       ['timestamp', 'open', 'close', 'next_return',
                        'next_mae_long', 'next_mae_short']]
@@ -927,43 +926,56 @@ def calculate_ensemble_trading_returns(
     if price_df['timestamp'].dt.tz is None:
         price_df['timestamp'] = pd.to_datetime(price_df['timestamp']).dt.tz_localize('UTC')
 
-    # Merge predictions with price data
+    # CRITICAL: Filter price_df to only include timestamps present in predictions
+    # Predictions have fewer rows than price_data due to windowing
+    pred_timestamps = set(pred_df['timestamp'])
+    price_df_filtered = price_df[price_df['timestamp'].isin(pred_timestamps)].copy()
+
+    logger.info(f"Price data: {len(price_df)} rows, Predictions: {len(pred_df)} rows, "
+                f"Filtered price data: {len(price_df_filtered)} rows")
+
+    # Merge predictions with filtered price data
     merged = pred_df.merge(
-        price_df,
+        price_df_filtered,
         on='timestamp',
         how='left'
     )
 
-    # Use next_return if available (open-to-close, same as individual seeds)
-    # Otherwise fall back to close-to-close calculation
+    # DIAGNOSTIC: Check if next_return column exists and has valid values
     if 'next_return' in merged.columns:
+        n_valid = merged['next_return'].notna().sum()
+        mean_return = merged['next_return'].mean()
+        logger.info(f"next_return column: {n_valid}/{len(merged)} valid values, mean={mean_return:.6f}")
         merged['fwd_return'] = merged['next_return']
-        logger.debug("Using next_return (open-to-close) for return calculation")
     else:
         # Fallback: calculate close-to-close returns
+        logger.warning(f"next_return NOT FOUND - available columns: {list(merged.columns)[:15]}")
         if 'close' in merged.columns:
             merged['fwd_return'] = merged['close'].pct_change().shift(-1)
-            logger.warning("next_return not available, using close-to-close returns (not comparable to individual seeds)")
+            logger.warning("Using close-to-close returns (not comparable to individual seeds)")
         else:
             logger.error("No return data available")
             return {'total_return': 0, 'n_trades': 0, 'sharpe': 0, 'win_rate': 0}
 
     # Apply regime filter if enabled
     n_regime_blocked = 0
-    if use_regime_filter and 'close' in price_df.columns:
+    if use_regime_filter and 'close' in price_df_filtered.columns:
         try:
             from regime_filter import apply_regime_filter_vectorized, RegimePresets
 
             # Create a temp predictions df with required format
             temp_pred = merged[['timestamp', 'should_trade', 'is_long']].copy()
 
-            # Get price series
-            price_series = price_df.set_index('timestamp')['close']
+            # CRITICAL FIX: Filter price series to match prediction timestamps
+            price_series = price_df_filtered.set_index('timestamp')['close']
 
-            # Get funding rates if available
+            # Verify shapes match
+            logger.info(f"Regime filter input shapes: predictions={len(temp_pred)}, price_series={len(price_series)}")
+
+            # Get funding rates if available (also filtered)
             funding_series = None
-            if 'funding_rate' in price_df.columns:
-                funding_series = price_df.set_index('timestamp')['funding_rate']
+            if 'funding_rate' in price_df_filtered.columns:
+                funding_series = price_df_filtered.set_index('timestamp')['funding_rate']
 
             # Apply regime filter
             config = regime_config if regime_config else RegimePresets.moderate()
@@ -992,6 +1004,8 @@ def calculate_ensemble_trading_returns(
             merged['regime_blocked'] = False
         except Exception as e:
             logger.warning(f"Regime filter failed: {e}, skipping")
+            import traceback
+            traceback.print_exc()
             merged['regime_blocked'] = False
     else:
         merged['regime_blocked'] = False
@@ -1030,13 +1044,13 @@ def calculate_ensemble_trading_returns(
             # Set stopped trades to stop-loss return
             merged.loc[stopped_mask, 'trade_return'] = stop_loss_pct
 
-            logger.debug(f"MAE-aware stop-loss: {n_stopped_out} trades stopped out")
+            logger.info(f"MAE-aware stop-loss: {n_stopped_out} trades stopped out of {int(long_mask.sum() + short_mask.sum())}")
         else:
             # Fallback: simple clip (less accurate)
+            logger.warning("MAE columns not available, using simple clip for stop-loss")
             before_clip = merged['trade_return'].copy()
             merged['trade_return'] = merged['trade_return'].clip(lower=stop_loss_pct)
             n_stopped_out = int((before_clip < stop_loss_pct).sum())
-            logger.debug(f"Simple stop-loss clip: {n_stopped_out} returns clipped")
 
     # Remove NaN
     valid = merged.dropna(subset=['trade_return'])
@@ -1048,7 +1062,13 @@ def calculate_ensemble_trading_returns(
     trade_returns = valid[valid['position'] != 0]['trade_return']
 
     total_return = trade_returns.sum() * 100  # As percentage
-    n_trades = (valid['position'] != 0).sum()
+    n_trades = int((valid['position'] != 0).sum())
+
+    # DIAGNOSTIC: Log trade breakdown
+    n_long = int((valid['position'] == 1.0).sum())
+    n_short = int((valid['position'] == -1.0).sum())
+    logger.info(f"Trades: {n_trades} total ({n_long} long, {n_short} short), "
+                f"Return: {total_return:.2f}%")
 
     if len(trade_returns) > 0 and trade_returns.std() > 0:
         # Annualized Sharpe using trade frequency
@@ -1065,7 +1085,7 @@ def calculate_ensemble_trading_returns(
 
     return {
         'total_return': total_return,
-        'n_trades': int(n_trades),
+        'n_trades': n_trades,
         'sharpe': sharpe,
         'win_rate': win_rate,
         'avg_return_per_trade': trade_returns.mean() * 100 if len(trade_returns) > 0 else 0,
